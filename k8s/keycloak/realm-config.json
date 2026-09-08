@@ -136,6 +136,28 @@
       ]
     },
     {
+      "clientId": "aws-console-sso",
+      "protocol": "saml",
+      "attributes": {
+        "saml.assertion.signature": "true",
+        "saml_name_id_format": "email",
+        "saml_signature_canonicalization_method": "http://www.w3.org/2001/10/xml-exc-c14n#"
+      },
+      "redirectUris": ["https://signin.aws.amazon.com/saml"],
+      "protocolMappers": [
+        {
+          "name": "role-list",
+          "protocol": "saml",
+          "protocolMapper": "saml-role-list-mapper",
+          "config": {
+            "single": "false",
+            "attribute.nameformat": "Basic",
+            "attribute.name": "https://aws.amazon.com/SAML/Attributes/Role"
+          }
+        }
+      ]
+    },
+    {
       "clientId": "siem-backend",
       "protocol": "openid-connect",
       "publicClient": false,
