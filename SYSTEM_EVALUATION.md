@@ -111,18 +111,29 @@ Istio sidecar (istio-proxy) chạy chung container group với từng service ap
 
 ### 3.2. Độ Trễ Xử Lý Request
 
-Đo bằng `tests/perf_overhead.py --n 100`, tất cả qua cùng đường SSH tunnel + `kubectl port-forward` (xem lưu ý phương pháp ở Mục 0).
+**Đo lại đúng phương pháp 2026-09-05 (T-5.3, xem `KET-QUA-KIEM-TRA.md`).** Bảng gốc bên dưới (đo qua `kubectl port-forward`) đã được xác nhận là đo SAI — `kubectl port-forward` kết nối thẳng vào network namespace của pod, bỏ qua hoàn toàn chuỗi iptables inbound của istio-proxy, nên "Full Zero Trust" ở bản đó thực chất KHÔNG đi qua Istio mTLS lẫn OPA ext_authz. Lần đo lại này gọi `GET /accounts/ACC-1001` từ bên trong mesh thật (`kubectl exec` vào pod `web-portal`, gọi DNS nội bộ `api-gateway.financial.svc.cluster.local`), xác nhận bằng decision log OPA (đúng 1 decision/request) — không còn bỏ qua sidecar.
 
-> **⚠️ Cảnh báo độ tin cậy (phát hiện 2026-08-23, sau khi migrate Istio):** `tests/perf_overhead.py` gọi `api-gateway` qua `$GW_URL=http://localhost:18080` (`kubectl port-forward`) — đã xác nhận bằng thực nghiệm rằng con đường này **bỏ qua hoàn toàn iptables interception của Istio** (chi tiết + cách verify: [FLOW_DETAIL.md](FLOW_DETAIL.md) §2.3). Nghĩa là dòng **"Full Zero Trust — JWT + Envoy mTLS + OPA"** dưới đây, đo TRƯỚC phát hiện này, nhiều khả năng **không đo đúng** overhead mTLS/OPA thật mà tài liệu tuyên bố — số +38ms có thể chỉ phản ánh JWT decode + Redis lookup ở tầng app, không có Istio mTLS handshake hay OPA ext_authz gRPC call nào thật sự xảy ra trên đường đo. **Số liệu dưới đây cần đo lại qua đường Traefik thật** (xác nhận bằng response header `server: istio-envoy`) trước khi dùng làm căn cứ cho bất kỳ kết luận nào về "chi phí latency của Zero Trust" — giữ nguyên bảng gốc bên dưới chỉ để tham khảo lịch sử, không dùng trích dẫn.
+**Thiết kế 4 cấu hình (A=hiện trạng, B=bỏ `http.send`, C=tắt OPA, D=tắt cả mTLS lẫn OPA), n=1000 + warm-up 100 mỗi cấu hình, khoảng tin cậy 95% qua bootstrap:**
+
+| Cấu hình | P50 | P50 CI95% | P95 | P99 | Mean |
+|---|---|---|---|---|---|
+| A — Hiện trạng | 108,65 ms | [108,08 ; 109,35] | 133,23 ms | 166,59 ms | 112,94 ms |
+| B — Bỏ `http.send` | 102,28 ms | [102,12 ; 102,49] | 120,47 ms | 158,60 ms | 106,03 ms |
+| C — OPA tắt | 102,16 ms | [101,93 ; 102,45] | 119,27 ms | 170,46 ms | 105,03 ms |
+| D — Không mTLS, không OPA | 102,02 ms | [101,75 ; 102,30] | 119,54 ms | 156,85 ms | 104,20 ms |
+
+**Kết luận (khác hẳn cả bản 28/06 lẫn bản 20/08/2026 phía trên):** giả thuyết "phần lớn overhead ~127ms là do `http.send`" — và cả giả thuyết rộng hơn "OPA/mTLS là nguyên nhân chính của độ trễ" — **bị bác bỏ bằng số liệu thật**. Tắt hẳn OPA (C) hoặc tắt cả mTLS lẫn OPA (D) ở hop client→api-gateway chỉ giảm p50 đúng ~6,5ms (6%) so với hiện trạng (A) — không phải "phần lớn". Bằng chứng trực tiếp: chính OPA tự đo được (`timer_rego_query_eval_ns` trong decision log) cho request có xác minh JWT thật chỉ mất **6,9ms** — một phần nhỏ của tổng ~108ms. Đã loại trừ độ trễ mạng thô giữa 2 cloud (đo `socket.connect()` thật tới `core-banking-openstack...:30080` — chỉ 0,9ms trung bình). Nghi vấn có căn cứ (chưa đo tách bạch hoàn toàn) cho phần overhead còn lại: cả `api-gateway` lẫn `payment-service` tạo `httpx.AsyncClient` MỚI cho MỖI request (không tái dùng connection pool), buộc 2 hop nội bộ tiếp theo (`api-gateway→payment-service→core-banking`) phải bắt tay mTLS mới mỗi lần — chi tiết đầy đủ ở `KET-QUA-KIEM-TRA.md` mục T-5.3.
+
+<details>
+<summary>Bảng đo cũ (qua <code>kubectl port-forward</code>, đã xác nhận đo sai đường — giữ lại chỉ để tham khảo lịch sử, KHÔNG trích dẫn)</summary>
 
 | Kịch bản | P50 | P95 | P99 | Mean |
 |---|---|---|---|---|
 | Baseline — `/health` (Envoy passthrough, không JWT/OPA) | 360,2 ms | 453,5 ms | 889,6 ms | 355,2 ms |
 | OPA-only — endpoint bảo vệ, không JWT (401/403 nhanh) | 311,3 ms | 404,4 ms | 454,7 ms | 322,1 ms |
-| Full Zero Trust — JWT + Envoy mTLS + OPA | 398,3 ms | 501,6 ms | 524,3 ms | 410,2 ms |
-| **Overhead (Full − Baseline)** | **+38,1 ms (9,6%)** | **+48,1 ms** | — | — |
+| Full Zero Trust — JWT + Envoy mTLS + OPA (đo sai, xem cảnh báo ở trên) | 398,3 ms | 501,6 ms | 524,3 ms | 410,2 ms |
 
-Con số ms tuyệt đối ở đây **cao hơn hẳn** bản 28/06 (baseline 360 ms so với 7,7 ms trước đó) — vì bản này đo qua 2 lớp SSH tunnel từ máy deployer, bản gốc gần như chắc chắn đo gần cluster hơn (khả năng cao là pod-to-pod nội bộ, không qua tunnel). **Không so sánh trực tiếp 2 con số tuyệt đối này.** Số liệu có thể so sánh được là **overhead tương đối do lớp OPA/JWT thêm vào cùng một đường truyền: +38 ms / +9,6% ở P50** trong lần đo này — thấp hơn con số +127 ms/lần đo trước, khả năng do khác biệt tải hệ thống và jitter mạng tunnel lớn hơn phần overhead OPA thật sự cộng thêm (baseline đã 360 ms, OPA-eval thật sự chỉ cỡ chục ms không còn nổi bật giữa nhiễu tunnel). Đo lại trong môi trường không qua tunnel (chạy script ngay trên node cluster) sẽ cho số đáng tin hơn cho luận điểm "chi phí latency của OPA".
+</details>
 
 ### 3.3. Thời Gian Phát Hiện Và Phản Ứng
 
@@ -172,7 +183,7 @@ Kết luận không đổi so với bản 28/06: Zero Trust mang lại cải thi
 
 ## 5. Hạn Chế Của Hệ Thống Hiện Tại
 
-**Latency đo qua tunnel, chưa tách được overhead OPA thuần:** Xem Mục 3.2 — cần đo lại ngay trên node cluster (không qua SSH tunnel + port-forward) để có con số overhead OPA đáng tin cậy.
+**Overhead ~100ms của endpoint có gọi cross-service/cross-cluster chưa được quy đúng nguyên nhân:** Xem Mục 3.2 (đo lại 2026-09-05, n=1000+CI) — đã xác nhận KHÔNG phải do OPA/mTLS/`http.send`, nghi vấn có căn cứ là do `api-gateway`/`payment-service` tạo `httpx.AsyncClient` mới cho mỗi request (không tái dùng connection pool) — chưa đo tách bạch để kết luận chắc chắn, cần một thí nghiệm riêng đổi sang client dùng chung rồi đo lại.
 
 **Phát hiện chỉ dựa trên rule cứng:** Hệ thống không học được pattern mới. Các kỹ thuật tấn công chưa được định nghĩa trong LogQL (slow brute force, insider threat thực hiện hành vi bình thường) sẽ không bị phát hiện. Cần tích hợp anomaly detection dựa trên ML trong tương lai.
 
@@ -184,4 +195,4 @@ Kết luận không đổi so với bản 28/06: Zero Trust mang lại cải thi
 
 ---
 
-*Số liệu đo trực tiếp từ hệ thống đang vận hành tại AWS ap-southeast-1 + OpenStack, ngày 20/08/2026. Raw output: `results/metrics.json`, `results/perf_overhead.json`.*
+*Số liệu đo trực tiếp từ hệ thống đang vận hành tại AWS ap-southeast-1 + OpenStack, ngày 20/08/2026 (Mục 1–2, 3.1, 3.3–3.4) và 05/09/2026 (Mục 3.2, đo lại đúng phương pháp). Raw output: `results/metrics.json`, `results/perf_overhead.json` (cũ, đo sai đường — xem cảnh báo Mục 3.2), `results/perf_overhead_t53.json` (mới, đúng phương pháp).*

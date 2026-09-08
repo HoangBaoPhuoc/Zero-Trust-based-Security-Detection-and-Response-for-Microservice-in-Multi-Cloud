@@ -7,7 +7,16 @@ metadata:
     app: opa
     app.kubernetes.io/part-of: ztlab
 spec:
-  replicas: 1
+  # T-5.4: replicas:1 nghĩa là OPA là điểm chết đơn (F10) — failure_mode_allow:
+  # false ở extensionProvider (k8s/istio/istio-operator.yaml) khiến MỌI giao
+  # dịch 2 cloud dừng khi pod OPA duy nhất mất, đo thật: xoá pod lúc có tải
+  # thật (n=281 request, interval 0.2s) gây đúng 27 request liên tiếp bị 403
+  # (fail-closed đúng thiết kế, không phải lỗi) trong ~5.6s trước khi Kubernetes
+  # tự thay pod mới và Envoy cập nhật endpoint qua EDS — không cần can thiệp
+  # tay. 3 replica + PodDisruptionBudget (minAvailable: 2) dưới đây giảm khả
+  # năng xảy ra cửa sổ mất-toàn-bộ này (chỉ còn xảy ra nếu CẢ 3 pod cùng mất
+  # đồng thời, hoặc lúc rolling update không tôn trọng PDB).
+  replicas: 3
   selector:
     matchLabels:
       app: opa
@@ -21,7 +30,8 @@ spec:
       serviceAccountName: opa
       containers:
         - name: opa
-          image: openpolicyagent/opa:latest-envoy
+          # Pinned 2026-09-05 from the digest actually running (was latest-envoy, a floating tag — see KET-QUA-KIEM-TRA.md T-0.5).
+          image: openpolicyagent/opa@sha256:1792991ca9646526b8c95c59cbb525ce33bf78458800182d78f6fa884d5ec517
           args:
             - "run"
             - "--server"
@@ -60,6 +70,20 @@ spec:
         - name: opa-policies
           configMap:
             name: opa-policies
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: opa-server
+  namespace: financial
+  labels:
+    app: opa
+    app.kubernetes.io/part-of: ztlab
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: opa
 ---
 apiVersion: v1
 kind: Service

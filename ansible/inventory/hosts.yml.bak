@@ -8,16 +8,16 @@ all:
     ssh_entrypoints:
       hosts:
         aws_bastion:
-          ansible_host: 13.229.237.119
+          ansible_host: 47.129.154.174
         aws_gateway:
-          ansible_host: 54.255.131.71
+          ansible_host: 13.228.93.165
           wg_tunnel_ip: "10.200.0.1"
           wg_peer_routes: "192.168.100.0/24,192.168.101.0/24,192.168.102.0/24"
 
     aws_private:
       vars:
         ansible_ssh_common_args: >-
-          -o ProxyJump=ubuntu@13.229.237.119
+          -o ProxyJump=ubuntu@47.129.154.174
           -o StrictHostKeyChecking=no
           -o UserKnownHostsFile=/dev/null
       hosts:
@@ -29,7 +29,7 @@ all:
     aws_monitoring:
       vars:
         ansible_ssh_common_args: >-
-          -o ProxyJump=ubuntu@13.229.237.119
+          -o ProxyJump=ubuntu@47.129.154.174
           -o StrictHostKeyChecking=no
           -o UserKnownHostsFile=/dev/null
       hosts:
@@ -43,13 +43,13 @@ all:
         os_dmz:
           hosts:
             os_gateway:
-              ansible_host: 172.10.10.167  # OpenStack floating IP
+              ansible_host: 172.10.10.100  # OpenStack floating IP
               wg_tunnel_ip: "10.200.0.2"
               wg_peer_routes: "10.10.1.0/24,10.10.2.0/24,10.10.4.0/24"
         os_private:
           vars:
             ansible_ssh_common_args: >-
-              -o ProxyJump=ubuntu@172.10.10.167
+              -o ProxyJump=ubuntu@172.10.10.100
               -o StrictHostKeyChecking=no
               -o UserKnownHostsFile=/dev/null
           hosts:

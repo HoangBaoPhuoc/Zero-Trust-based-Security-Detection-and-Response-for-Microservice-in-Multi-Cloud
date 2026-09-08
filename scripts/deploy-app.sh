@@ -117,6 +117,22 @@ wait_statefulset() {
   kubectl --context "$ctx" rollout status "statefulset/$name" -n "$ns" --timeout="$timeout"
 }
 
+regenerate_policy_files() {
+  step "Step 0b: Regenerate OPA/NetworkPolicy files from policy/service-graph.yaml"
+  # Safety net for VIEC-CON-TON-DONG.md item 3: opa/policies/service_acl.rego
+  # and k8s/financial/network-policies/{aws,os}-pod-segmentation.yaml are
+  # GENERATED from policy/service-graph.yaml, committed to the repo as the
+  # deployable artifact. If someone edits service-graph.yaml but forgets to
+  # re-run the 2 generators before deploying, the cluster silently gets the
+  # OLD policy instead (tests/test_service_graph_consistency.py only catches
+  # this in CI/manually run, not automatically on deploy). Run both here,
+  # before anything reads either output file, so that can no longer happen.
+  # No-op (git-clean) when service-graph.yaml already matches committed output.
+  python3 "$REPO_ROOT/scripts/gen-rego-acl.py"
+  python3 "$REPO_ROOT/scripts/gen-networkpolicy.py"
+  ok "Policy files regenerated from policy/service-graph.yaml"
+}
+
 apply_namespaces() {
   step "Step 1: Namespaces"
   kaws apply -f "$REPO_ROOT/k8s/namespaces.yaml"
@@ -276,6 +292,189 @@ else:
   kubectl --context "$AWS_CONTEXT" delete pod kc-ldap-federation-setup -n identity --ignore-not-found --wait=false >/dev/null 2>&1 || true
 
   ok "OpenLDAP deployed, seeded, and registered as Keycloak User Federation (READ_ONLY, demo directory — not a real corporate LDAP)"
+}
+
+deploy_audience_mapper() {
+  step "Step 3b2: Keycloak Audience protocol mapper (web-portal/api-gateway -> aud=api-gateway)"
+  if [[ "$SKIP_SECURITY_STACK" == true ]]; then
+    log "Skipping Audience mapper (security stack was skipped, Keycloak not available)"
+    return
+  fi
+
+  local admin_pass
+  admin_pass="$(kaws get secret keycloak-secret -n identity -o jsonpath='{.data.admin-password}' | base64 -d)"
+
+  # Same idempotency caveat as deploy_openldap_and_federation: realm-config.json
+  # now declares this mapper for a FRESH import, but --import-realm won't
+  # retrofit it onto an already-imported realm (T-1.4 regression, 2026-09-05:
+  # this exact mapper was added by hand via Admin API in a previous session,
+  # then silently lost on the next from-scratch deploy-all.sh because it lived
+  # nowhere else). Register it live too so every deploy ends up with it.
+  kaws delete pod kc-audience-mapper-setup -n identity --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  kaws run kc-audience-mapper-setup --image=python:3.12-alpine -n identity --restart=Never --command -- sh -c "sleep 60" >/dev/null 2>&1 || true
+  kubectl --context "$AWS_CONTEXT" wait --for=condition=Ready pod/kc-audience-mapper-setup -n identity --timeout=60s >/dev/null 2>&1 || true
+  kubectl --context "$AWS_CONTEXT" exec -n identity kc-audience-mapper-setup -- python3 -c "
+import urllib.request, json, urllib.parse
+
+tok_data = urllib.parse.urlencode({'grant_type':'password','client_id':'admin-cli','username':'admin','password':'$admin_pass'}).encode()
+req = urllib.request.Request('http://keycloak.identity.svc.cluster.local:8080/realms/master/protocol/openid-connect/token', data=tok_data)
+token = json.load(urllib.request.urlopen(req))['access_token']
+headers = {'Authorization': 'Bearer ' + token}
+
+for client_id in ('api-gateway', 'web-portal'):
+    req = urllib.request.Request('http://keycloak.identity.svc.cluster.local:8080/admin/realms/ztlab/clients?clientId=' + client_id, headers=headers)
+    clients = json.load(urllib.request.urlopen(req))
+    if not clients:
+        print(client_id, '-> client not found, skipping')
+        continue
+    internal_id = clients[0]['id']
+
+    req = urllib.request.Request('http://keycloak.identity.svc.cluster.local:8080/admin/realms/ztlab/clients/' + internal_id + '/protocol-mappers/models', headers=headers)
+    mappers = json.load(urllib.request.urlopen(req))
+    if any(m.get('name') == 'aud-api-gateway' for m in mappers):
+        print(client_id, '-> aud-api-gateway mapper already present, skipping')
+        continue
+
+    payload = {
+        'name': 'aud-api-gateway', 'protocol': 'openid-connect',
+        'protocolMapper': 'oidc-audience-mapper', 'consentRequired': False,
+        'config': {'included.client.audience': 'api-gateway', 'id.token.claim': 'false', 'access.token.claim': 'true'},
+    }
+    req = urllib.request.Request(
+        'http://keycloak.identity.svc.cluster.local:8080/admin/realms/ztlab/clients/' + internal_id + '/protocol-mappers/models',
+        data=json.dumps(payload).encode(), headers={**headers, 'Content-Type': 'application/json'}, method='POST')
+    urllib.request.urlopen(req)
+    print(client_id, '-> aud-api-gateway mapper created')
+" || warn "Keycloak Audience mapper setup failed (non-fatal — but T-1.4 audience check degrades to a no-op without it, see KET-QUA-KIEM-TRA.md)"
+  kubectl --context "$AWS_CONTEXT" delete pod kc-audience-mapper-setup -n identity --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+  ok "Keycloak Audience mapper ensured on web-portal + api-gateway clients"
+}
+
+deploy_stepup_flow() {
+  step "Step 3b3: Keycloak browser-stepup authentication flow (T-4.2 step-up OTP)"
+  if [[ "$SKIP_SECURITY_STACK" == true ]]; then
+    log "Skipping browser-stepup flow (security stack was skipped, Keycloak not available)"
+    return
+  fi
+
+  local admin_pass
+  admin_pass="$(kaws get secret keycloak-secret -n identity -o jsonpath='{.data.admin-password}' | base64 -d)"
+
+  # Same idempotency caveat as deploy_audience_mapper/deploy_openldap_and_federation:
+  # client "web-portal-stepup" comes from realm-config.json on fresh --import-realm,
+  # but the authentication flow it needs to bind to does NOT — it was hand-built via
+  # Admin API in a prior session and lost on the next from-scratch deploy (see
+  # VIEC-CON-TON-DONG.md item 1). Register it live too so every deploy ends up with it.
+  kaws delete pod kc-stepup-flow-setup -n identity --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  kaws run kc-stepup-flow-setup --image=python:3.12-alpine -n identity --restart=Never --command -- sh -c "sleep 60" >/dev/null 2>&1 || true
+  kubectl --context "$AWS_CONTEXT" wait --for=condition=Ready pod/kc-stepup-flow-setup -n identity --timeout=60s >/dev/null 2>&1 || true
+  kubectl --context "$AWS_CONTEXT" exec -n identity kc-stepup-flow-setup -- python3 -c "
+import urllib.request, json, urllib.parse
+
+KC = 'http://keycloak.identity.svc.cluster.local:8080'
+REALM = 'ztlab'
+
+def call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(KC + path, data=data, headers=headers, method=method)
+    if data is not None:
+        req.add_header('Content-Type', 'application/json')
+    try:
+        resp = urllib.request.urlopen(req)
+        raw = resp.read()
+        return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f'{method} {path} -> {e.code}: {e.read().decode()}')
+
+tok_data = urllib.parse.urlencode({'grant_type':'password','client_id':'admin-cli','username':'admin','password':'$admin_pass'}).encode()
+token = json.load(urllib.request.urlopen(urllib.request.Request(KC + '/realms/master/protocol/openid-connect/token', data=tok_data)))['access_token']
+headers = {'Authorization': 'Bearer ' + token}
+
+flows = call('GET', f'/admin/realms/{REALM}/authentication/flows')
+if any(f['alias'] == 'browser-stepup' for f in flows):
+    print('browser-stepup flow already exists, skipping creation')
+else:
+    # 1. Copy built-in 'browser' -> 'browser-stepup' (brings 'browser-stepup forms'
+    #    and its nested Conditional-OTP subflow along for free).
+    call('POST', f'/admin/realms/{REALM}/authentication/flows/browser/copy', {'newName': 'browser-stepup'})
+
+    # 2. Add a new CONDITIONAL subflow 'Stepup-2fa' as a child of 'browser-stepup
+    #    forms' (NOT of 'browser-stepup' itself, or it lands at the wrong level).
+    call('POST', f'/admin/realms/{REALM}/authentication/flows/browser-stepup%20forms/executions/flow',
+         {'name': 'Stepup-2fa', 'description': 'Step-up: OTP khi LoA >= 2 (acr=high)', 'provider': 'basic-flow', 'type': 'basic-flow'})
+
+    execs = call('GET', f'/admin/realms/{REALM}/authentication/flows/browser-stepup/executions')
+    stepup_exec = next(e for e in execs if e.get('level') == 1 and e.get('authenticationFlow') and e.get('description', '').startswith('Step-up:'))
+    flow_id = stepup_exec['flowId']
+
+    # QUIRK (found 2026-09-08, re-derived from scratch after infra destroy): the
+    # 'executions/flow' endpoint's JSON body field is 'name' per the docs, but on
+    # this Keycloak 24.0.3 it does NOT set the resulting flow's alias — the new
+    # flow comes back with alias=null, so every subsequent by-alias lookup
+    # ('/authentication/flows/Stepup-2fa/...') 400s with 'Parent flow doesn't
+    # exist'. Fix: PUT the flow object directly with the alias set explicitly.
+    call('PUT', f'/admin/realms/{REALM}/authentication/flows/{flow_id}',
+         {'id': flow_id, 'alias': 'Stepup-2fa', 'description': 'Step-up: OTP khi LoA >= 2 (acr=high)',
+          'providerId': 'basic-flow', 'topLevel': False, 'builtIn': False})
+
+    # 3. Flip the subflow execution from DISABLED -> CONDITIONAL.
+    call('PUT', f'/admin/realms/{REALM}/authentication/flows/browser-stepup%20forms/executions',
+         {'id': stepup_exec['id'], 'requirement': 'CONDITIONAL'})
+
+    # 4. Add the 2 child executions inside 'Stepup-2fa' and require both.
+    call('POST', f'/admin/realms/{REALM}/authentication/flows/Stepup-2fa/executions/execution', {'provider': 'conditional-level-of-authentication'})
+    call('POST', f'/admin/realms/{REALM}/authentication/flows/Stepup-2fa/executions/execution', {'provider': 'auth-otp-form'})
+    child_execs = call('GET', f'/admin/realms/{REALM}/authentication/flows/Stepup-2fa/executions')
+    cond_exec = next(e for e in child_execs if e['providerId'] == 'conditional-level-of-authentication')
+    otp_exec = next(e for e in child_execs if e['providerId'] == 'auth-otp-form')
+    call('PUT', f'/admin/realms/{REALM}/authentication/flows/Stepup-2fa/executions', {'id': cond_exec['id'], 'requirement': 'REQUIRED'})
+    call('PUT', f'/admin/realms/{REALM}/authentication/flows/Stepup-2fa/executions', {'id': otp_exec['id'], 'requirement': 'REQUIRED'})
+
+    # 5. Configure the LoA condition: acr=high (level 2), 10h cached max-age.
+    #    Key names MUST be 'loa-condition-level'/'loa-max-age' — the UI helpText
+    #    names ('level'/'maxAge') are silently ignored, LoA check never fires.
+    call('POST', f'/admin/realms/{REALM}/authentication/executions/{cond_exec[\"id\"]}/config',
+         {'alias': 'stepup-loa-2', 'config': {'loa-condition-level': '2', 'loa-max-age': '36000'}})
+
+    print('browser-stepup flow created')
+
+# 6. Bind 'browser-stepup' as the browser flow of client 'web-portal-stepup' ONLY.
+#    Do NOT bind it on 'web-portal' — that forces OTP on every normal login (regression
+#    seen once already, see KET-QUA-KIEM-TRA.md).
+browser_stepup_id = next(f['id'] for f in call('GET', f'/admin/realms/{REALM}/authentication/flows') if f['alias'] == 'browser-stepup')
+clients = call('GET', f'/admin/realms/{REALM}/clients?clientId=web-portal-stepup')
+if not clients:
+    print('web-portal-stepup client not found, skipping flow binding')
+else:
+    client_id = clients[0]['id']
+    overrides = clients[0].get('authenticationFlowBindingOverrides', {})
+    if overrides.get('browser') == browser_stepup_id:
+        print('web-portal-stepup already bound to browser-stepup, skipping')
+    else:
+        overrides['browser'] = browser_stepup_id
+        call('PUT', f'/admin/realms/{REALM}/clients/{client_id}', {'authenticationFlowBindingOverrides': overrides})
+        print('web-portal-stepup bound to browser-stepup')
+
+# 7. Ensure the demo user exists with CONFIGURE_TOTP pending. This only creates
+# the account/required-action — it deliberately does NOT fabricate an OTP
+# secret (secretData must come from a real QR enrollment via the browser; a
+# hand-rolled secret was tried before and is not a faithful demo — see
+# VIEC-CON-TON-DONG.md item 1). Finish enrollment once, interactively, via
+# \$KC_URL/realms/ztlab/account, then the credential persists across redeploys
+# (it lives in Postgres, not in this script).
+users = call('GET', f'/admin/realms/{REALM}/users?username=stepup-demo&exact=true')
+if users:
+    print('stepup-demo user already exists, skipping')
+else:
+    call('POST', f'/admin/realms/{REALM}/users',
+         {'username': 'stepup-demo', 'enabled': True, 'requiredActions': ['CONFIGURE_TOTP'],
+          'credentials': [{'type': 'password', 'value': 'StepupDemo123!', 'temporary': False}]})
+    print('stepup-demo user created (requiredActions=CONFIGURE_TOTP, needs one interactive login to enroll real OTP)')
+" || warn "Keycloak browser-stepup flow setup failed (non-fatal — but T-4.2 step-up OTP degrades to no-op without it, see VIEC-CON-TON-DONG.md item 1)"
+  kubectl --context "$AWS_CONTEXT" delete pod kc-stepup-flow-setup -n identity --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+  ok "Keycloak browser-stepup flow ensured, bound to web-portal-stepup client"
 }
 
 deploy_aws_saml_federation() {
@@ -766,6 +965,7 @@ main() {
   verify_context "$AWS_CONTEXT"
   verify_context "$OS_CONTEXT"
 
+  regenerate_policy_files
   apply_namespaces
   apply_network_policies
   deploy_gatekeeper
@@ -773,6 +973,8 @@ main() {
   sync_images
   deploy_security_stack
   deploy_openldap_and_federation
+  deploy_audience_mapper
+  deploy_stepup_flow
   deploy_aws_saml_federation
   deploy_financial_infra
   deploy_financial_services

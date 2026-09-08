@@ -9,23 +9,12 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Intra-cluster: OS services talk to each other
-    # 15006=Envoy mTLS, 8080=app HTTP, 9191=OPA gRPC, 5432=postgres, 6379=redis
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: financial
-      ports:
-        - port: 15006
-          protocol: TCP
-        - port: 8080
-          protocol: TCP
-        - port: 9191
-          protocol: TCP
-        - port: 5432
-          protocol: TCP
-        - port: 6379
-          protocol: TCP
+    # T-3.1 (2026-09-05): rule namespace-wide "financial -> financial" (mọi
+    # port 15006/8080/9191/5432/6379) đã bị xoá — thay bằng NetworkPolicy
+    # pod-level riêng cho từng đích trong os-pod-segmentation.yaml, đúng ma
+    # trận traffic thật (T-1.1): core-banking -> account-service/
+    # transaction-service, account-service -> postgres-accounts,
+    # transaction-service -> postgres-txn. Xem chi tiết + lý do trong file đó.
     # Cross-cloud: AWS K3s nodes and pod subnets (via MASQUERADE on workers)
     # 15006=Envoy mTLS inbound, 8080=plain HTTP (metrics, health checks)
     - from:
@@ -55,6 +44,14 @@ spec:
           protocol: TCP
         - port: 8080
           protocol: TCP
+        # opa-service:8181/health (security-healthcheck, namespace spire).
+        # Added alongside the namespaceSelector:spire rule below because this
+        # ipBlock-based rule is the one already proven to be enforced by k3s's
+        # embedded netpol controller for cross-node pod-CIDR traffic on this
+        # cluster (see the cross-node NodePort note above); a brand-new
+        # namespaceSelector match may need a resync to materialize.
+        - port: 8181
+          protocol: TCP
     # Prometheus (monitoring namespace) scraping /metrics on port 8080
     - from:
         - namespaceSelector:
@@ -64,6 +61,19 @@ spec:
         - port: 8080
           protocol: TCP
         - port: 15006
+          protocol: TCP
+    # k8s/security-monitoring/healthcheck-cronjob.yaml (namespace spire) calls
+    # opa-service:8181/health directly to verify OPA's REST API is reachable.
+    # Same gap as AWS's aws-allow-list.yaml (found there 2026-08-24) but never
+    # mirrored to this file: the 10.42.0.0/16 rule above only opens 15006/8080,
+    # not 8181, so every run of security-healthcheck on OpenStack reports
+    # opa_unreachable even though opa-server itself is healthy.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: spire
+      ports:
+        - port: 8181
           protocol: TCP
   egress:
     # DNS

@@ -1,0 +1,188 @@
+# GENERATED FILE — KHÔNG SỬA TAY. Nguồn: policy/service-graph.yaml
+# Sinh lại: python3 scripts/gen-networkpolicy.py
+#
+# T-3.1/T-3.2 — mỗi NetworkPolicy chỉ siết chiều INGRESS của một workload
+# đích, khớp đúng traffic thật đã đo (T-1.1). Egress không đổi (xem
+# aws-allow-list.yaml). LƯU Ý: NetworkPolicy này hiện KHÔNG được kube-router
+# enforce cho traffic có Istio sidecar trên hạ tầng đang dùng — xem
+# KET-QUA-KIEM-TRA.md §T-3.1 trước khi coi đây là lớp bảo vệ đang hoạt động.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aws-pod-api-gateway
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: api-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web-portal
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 15006
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aws-pod-fraud-detection
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: fraud-detection
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: payment-service
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 15006
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aws-pod-notification-service
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: notification-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: payment-service
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 15006
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aws-pod-opa
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: opa
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web-portal
+      ports:
+        - port: 9191
+          protocol: TCP
+        - port: 8181
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 9191
+          protocol: TCP
+        - port: 8181
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: payment-service
+      ports:
+        - port: 9191
+          protocol: TCP
+        - port: 8181
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fraud-detection
+      ports:
+        - port: 9191
+          protocol: TCP
+        - port: 8181
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: notification-service
+      ports:
+        - port: 9191
+          protocol: TCP
+        - port: 8181
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aws-pod-payment-service
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 15006
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aws-pod-redis
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 6379
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fraud-detection
+      ports:
+        - port: 6379
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web-portal
+      ports:
+        - port: 6379
+          protocol: TCP

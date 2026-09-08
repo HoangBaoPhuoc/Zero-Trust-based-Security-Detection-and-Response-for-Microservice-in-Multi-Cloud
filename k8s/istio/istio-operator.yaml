@@ -56,3 +56,12 @@ spec:
         envoyExtAuthzGrpc:
           service: opa-service.financial.svc.cluster.local
           port: "9191"
+          # T-4.2: OPA cần đọc "amount" từ body JSON của /payments để quyết
+          # định requires_step_up (>10 triệu/lần) — mặc định Envoy KHÔNG gửi
+          # body cho ext_authz check, chỉ có method/path/headers. maxRequestBytes
+          # 8KiB đủ cho payload /payments (vài trường số/chuỗi ngắn); vượt quá
+          # thì allowPartialMessage vẫn cho OPA thấy phần đầu thay vì lỗi hẳn.
+          includeRequestBodyInCheck:
+            maxRequestBytes: 8192
+            allowPartialMessage: true
+            packAsBytes: false

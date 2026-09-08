@@ -66,31 +66,28 @@ spec:
       subjectAltNames:
         - "spiffe://ztlab.local/aws/notification-service"
 ---
-# notification-service (canary, Phase 4): payment-service calls POST /notify
-# fire-and-forget. valid_svid-only check in zta_policy.rego's
-# internal_service_request rule (no specific principal restriction) maps
-# directly to a native ALLOW policy — no CUSTOM/OPA needed for this one.
+# notification-service: was a native ALLOW policy with source.principals:
+# ["*"] — ANY workload with a valid SPIFFE ID in the mesh could POST
+# /notify, not just payment-service (found 2026-09-05 while building the
+# service_acl matrix, see KET-QUA-KIEM-TRA.md T-1.1 — payment-service ->
+# notification-service traffic never showed up in OPA decision logs because
+# this path never went through OPA at all). Switched to CUSTOM/OPA like the
+# other services so the same service_acl (opa/policies/zta_policy.rego)
+# governs who may call /notify.
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
 metadata:
-  name: notification-service-allow
+  name: notification-service-opa-authz
   namespace: financial
 spec:
   selector:
     matchLabels:
       app: notification-service
-  action: ALLOW
+  action: CUSTOM
+  provider:
+    name: opa-ext-authz
   rules:
-    - from:
-        - source:
-            principals: ["*"]
-      to:
-        - operation:
-            methods: ["POST"]
-            paths: ["/notify"]
-    - to:
-        - operation:
-            paths: ["/health", "/ready"]
+    - {}
 ---
 # api-gateway, payment-service, fraud-detection (Phase 6 batch 2): unlike
 # notification-service, these carry REAL Rego logic with no native Istio
@@ -304,8 +301,13 @@ spec:
       subjectAltNames:
         - "spiffe://ztlab.local/aws/web-portal"
 ---
-# Cross-cloud: payment-service (Istio-managed, AWS) → core-banking (still
-# hand-rolled Envoy, OpenStack) via the WireGuard-reachable NodePort.
+# Cross-cloud: payment-service (Istio-managed, AWS) → core-banking
+# (Istio-managed, OpenStack) via the WireGuard-reachable NodePort. Both
+# sides are on istio-proxy — this comment previously said core-banking was
+# still hand-rolled Envoy, which stopped being true once migration finished;
+# confirmed end-to-end mTLS still works over this NodePort path (see
+# KET-QUA-KIEM-TRA.md T-0.4): core-banking's istio-proxy extracts the
+# correct SPIFFE ID from payment-service's client cert.
 #
 # Tried and abandoned: a ServiceEntry with a fake hostname + STATIC
 # resolution. Istio's validation webhook rejects a raw IP as `hosts` ("domain

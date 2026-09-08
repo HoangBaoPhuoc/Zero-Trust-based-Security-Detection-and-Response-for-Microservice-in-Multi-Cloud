@@ -46,6 +46,16 @@ spec:
         sidecar.istio.io/inject: "true"
         sidecar.istio.io/userVolume: '[{"name":"spire-workload-socket","hostPath":{"path":"/run/spire/sockets/agent.sock","type":"Socket"}}]'
         sidecar.istio.io/userVolumeMount: '[{"name":"spire-workload-socket","mountPath":"/var/run/secrets/workload-spiffe-uds/socket"}]'
+        # Phát hiện 2026-09-05 (KET-QUA-KIEM-TRA.md T-1.2): main.py gọi Keycloak
+        # ngay trong FastAPI startup event, nhưng istio-proxy đôi khi chưa sẵn
+        # sàng route egress tại đúng thời điểm đó -> "Connection refused" ->
+        # _jwks_keys rỗng -> mọi request cần JWT bị 503 tới khi vòng lặp retry
+        # 300s tự chạy lại. ĐÃ THỬ annotation chuẩn của Istio
+        # (`proxy.istio.io/config: holdApplicationUntilProxyStarts`) — bị revert
+        # ngay: gây istio-proxy tự PostStartHook fail/crash-loop trên bản Istio
+        # 1.22.3 + cách mount socket SPIRE qua userVolume ở đây (không tương
+        # thích), pod mới không bao giờ Ready. Chưa có fix an toàn — ghi nhận
+        # là known issue, xem KET-QUA-KIEM-TRA.md.
     spec:
       serviceAccountName: api-gateway
       volumes:
@@ -75,6 +85,13 @@ spec:
               value: "redis://:$(REDIS_PASSWORD)@redis.financial.svc.cluster.local:6379/0"
             - name: IP_BLOCK_ENABLED
               value: "true"
+            # T-1.4: trước đây rỗng -> _decode_jwt() tắt verify_aud, token phát
+            # cho BẤT KỲ client nào trong realm ztlab đều dùng được ở đây. Giờ
+            # bắt buộc đúng audience "api-gateway" — khớp Audience protocol
+            # mapper vừa thêm vào client "web-portal" (luồng đăng nhập thật)
+            # và "api-gateway" (client dùng cho gọi API/test trực tiếp).
+            - name: JWT_AUDIENCE
+              value: "api-gateway"
           readinessProbe:
             httpGet:
               path: /health
@@ -165,11 +182,6 @@ spec:
             # in-mesh destination.
             - name: CORE_BANKING_URL
               value: "http://core-banking-openstack.financial.svc.cluster.local:30080"
-            - name: CORE_BANKING_SHARED_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: core-banking-integrity-secret
-                  key: shared-secret
             - name: MAX_SINGLE_TXN_VND
               value: "500000000"
           readinessProbe:
@@ -221,6 +233,45 @@ spec:
         sidecar.istio.io/userVolumeMount: '[{"name":"spire-workload-socket","mountPath":"/var/run/secrets/workload-spiffe-uds/socket"}]'
     spec:
       serviceAccountName: fraud-detection
+      # T-1.5: fraud-detection signs the fraud verdict with its own SPIRE
+      # X.509-SVID private key (shared/svid_sign.py) instead of a shared HMAC
+      # secret. istio-proxy already has the Workload API socket via the
+      # sidecar.istio.io/userVolume annotation above, but that mount is
+      # istio-proxy-only -- the app container needs its own path to the SVID
+      # material. No pyspiffe on PyPI (checked 2026-09-05) to call the
+      # Workload API gRPC directly from Python, so a small sidecar running
+      # the actual spire-agent binary (same image/version as the node
+      # DaemonSet) writes cert/key/bundle to a shared emptyDir on a loop --
+      # the standard SPIRE "file writer" pattern. initContainer does the
+      # first fetch so the app never starts without a valid SVID already on
+      # disk (avoids the T-1.2-style startup race).
+      initContainers:
+        - name: svid-init
+          image: ghcr.io/spiffe/spire-agent:1.9.4
+          command: ["/opt/spire/bin/spire-agent", "api", "fetch", "x509",
+                    "-socketPath", "/run/spire/sockets/agent.sock", "-write", "/svid"]
+          volumeMounts:
+            - name: spire-socket
+              mountPath: /run/spire/sockets
+            - name: svid
+              mountPath: /svid
+        # Periodic refresh sidecar REMOVED for now (2026-09-05) -- two
+        # attempts both caused a real outage (Service endpoints went to zero
+        # because the fetch-and-exit container's cycling left the Pod
+        # Ready=False, tried both as a regular container and as a
+        # restartPolicy:Always "native sidecar" init container -- neither
+        # kept the Pod Ready on this k3s v1.29.3 build). Reverted both times
+        # within minutes; confirmed via `kubectl get endpoints
+        # fraud-detection` going empty and back. For now: svid-init above
+        # fetches ONCE at pod start only -- the SVID is valid 1h (see
+        # default_x509_svid_ttl) and is NOT refreshed after that, so a
+        # fraud-detection pod running longer than ~1h will start signing
+        # verdicts with an expired cert (core-banking's verify() will then
+        # reject them as cert_expired_or_not_yet_valid -- fails CLOSED, not
+        # silently insecure, but real payments would break). Known gap, see
+        # KET-QUA-KIEM-TRA.md T-1.5 -- needs a different mechanism (a
+        # readinessProbe-gated approach, or a custom image with a shell)
+        # before this can run unattended past 1h.
       containers:
         - name: fraud-detection
           image: ztlab/fraud-detection:1.0.0
@@ -239,6 +290,10 @@ spec:
               value: "redis://:$(REDIS_PASSWORD)@redis.financial.svc.cluster.local:6379/0"
             - name: FRAUD_VELOCITY_WINDOW_SECONDS
               value: "900"
+          volumeMounts:
+            - name: svid
+              mountPath: /svid
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -251,6 +306,13 @@ spec:
               port: http
             initialDelaySeconds: 15
             periodSeconds: 20
+      volumes:
+        - name: spire-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: Directory
+        - name: svid
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

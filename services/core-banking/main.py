@@ -1,7 +1,6 @@
 # ZTLab - core-banking
 
-import hashlib
-import hmac
+import base64
 import os
 import time
 import uuid
@@ -12,13 +11,21 @@ from pydantic import BaseModel, Field
 
 from shared.logging import ZTLabLogger, trace_middleware
 from shared.metrics import SERVICE_UP, TXN_TOTAL
+from shared.svid_sign import build_canonical, load_trust_bundle, verify as verify_svid_signature
 
 SERVICE = "core-banking"
 CLOUD = os.getenv("CLOUD_PROVIDER", "aws")
 MAX_FRAUD_SCORE = int(os.getenv("MAX_ALLOWED_FRAUD_SCORE", os.getenv("MAX_FRAUD_SCORE", "74")))
 ACCOUNT_SERVICE_URL = os.getenv("ACCOUNT_SERVICE_URL", "http://account-service:8080").rstrip("/")
 TRANSACTION_SERVICE_URL = os.getenv("TRANSACTION_SERVICE_URL", "http://transaction-service:8080").rstrip("/")
-CORE_BANKING_SHARED_SECRET = os.getenv("CORE_BANKING_SHARED_SECRET", "")
+# T-1.5: trước đây xác minh chữ ký bằng CORE_BANKING_SHARED_SECRET (HMAC đối
+# xứng) -- payment-service tự ký hộ fraud-detection, dùng chung 1 secret cho
+# cả 2 chiều. Giờ verdict được chính fraud-detection ký bằng SVID X.509 của
+# nó (bất đối xứng); core-banking chỉ cần biết ai được PHÉP ký, không cần giữ
+# bí mật gì để verify. Xem shared/svid_sign.py + KET-QUA-KIEM-TRA.md T-1.5.
+EXPECTED_FRAUD_SIGNER_SPIFFE_ID = os.getenv(
+    "EXPECTED_FRAUD_SIGNER_SPIFFE_ID", "spiffe://ztlab.local/aws/fraud-detection"
+)
 
 app = FastAPI(title="ZTLab Core Banking API")
 app.add_middleware(trace_middleware(SERVICE, CLOUD))
@@ -33,23 +40,6 @@ class ExecuteTransactionRequest(BaseModel):
     amount: float = Field(gt=0)
     currency: str = "VND"
     trace_id: str = ""
-
-
-def _expected_fraud_signature(trace_id: str, body: ExecuteTransactionRequest, score: int, timestamp: int) -> str:
-    canonical = "|".join([
-        str(timestamp),
-        trace_id,
-        body.from_account,
-        body.to_account,
-        f"{body.amount:.2f}",
-        body.currency,
-        str(score),
-    ])
-    return hmac.new(
-        CORE_BANKING_SHARED_SECRET.encode("utf-8"),
-        canonical.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
 
 
 @app.post("/transactions/execute")
@@ -68,13 +58,24 @@ async def execute_transaction(req: Request, body: ExecuteTransactionRequest):
     now = int(time.time())
     timestamp_valid = abs(now - fraud_timestamp) <= 60
 
-    signature = req.headers.get("X-Fraud-Gate-Signature", "")
+    signature_b64 = req.headers.get("X-Fraud-Signature", "")
+    cert_b64 = req.headers.get("X-Fraud-Cert", "")
     signature_valid = False
-    if CORE_BANKING_SHARED_SECRET and signature and timestamp_valid:
-        signature_valid = hmac.compare_digest(
-            signature,
-            _expected_fraud_signature(trace_id, body, fraud_score, fraud_timestamp),
-        )
+    signature_reason = "missing_signature_or_cert"
+    if signature_b64 and cert_b64 and timestamp_valid:
+        try:
+            cert_chain_pem = base64.b64decode(cert_b64)
+        except Exception as exc:
+            signature_reason = f"cert_b64_decode_error: {exc}"
+        else:
+            canonical = build_canonical(
+                fraud_timestamp, trace_id, body.from_account, body.to_account, body.amount, body.currency, fraud_score
+            )
+            signature_valid, signature_reason = verify_svid_signature(
+                cert_chain_pem, signature_b64, canonical, EXPECTED_FRAUD_SIGNER_SPIFFE_ID, load_trust_bundle()
+            )
+    elif not timestamp_valid:
+        signature_reason = "timestamp_out_of_window"
 
     if fraud_gate != "passed" or fraud_score > MAX_FRAUD_SCORE or not signature_valid:
         TXN_TOTAL.labels(service=SERVICE, cloud=CLOUD, type="core_execute", status="fraud_gate_denied").inc()
@@ -85,6 +86,7 @@ async def execute_transaction(req: Request, body: ExecuteTransactionRequest):
             fraud_score=fraud_score,
             max_fraud_score=MAX_FRAUD_SCORE,
             fraud_signature_valid=signature_valid,
+            fraud_signature_reason=signature_reason,
             fraud_timestamp_valid=timestamp_valid,
             from_account=body.from_account,
             to_account=body.to_account,

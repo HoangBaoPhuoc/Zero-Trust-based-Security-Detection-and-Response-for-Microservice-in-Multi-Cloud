@@ -1,6 +1,6 @@
 # ZTLab — Zero Trust Security Detection & Response
 
-ZTLab là một **testbed thực nghiệm** hiện thực hoá các nguyên lý Zero Trust Architecture (NIST SP 800-207) trên một hệ thống microservices tài chính triển khai thật trên hai cloud (AWS + OpenStack), thay vì mô phỏng trên giấy hay chạy trên một cụm đơn lẻ. Luồng vận hành: user đăng nhập qua Keycloak OIDC/PKCE, mọi request qua API Gateway đều bị chặn bởi Istio sidecar (istio-proxy) + OPA ext_authz (CUSTOM AuthorizationPolicy) trước khi tới ứng dụng, giao dịch được fraud-detection chấm điểm rủi ro (kèm tín hiệu device trust), rồi ghi nhận tại Core Banking trên OpenStack qua kết nối mTLS do SPIRE cấp phát. Log từ cả hai cloud đổ về PLG Stack (Promtail → Loki → Grafana); khi Grafana phát hiện 1 trong 5 mẫu hành vi tấn công đã định nghĩa, SOAR Engine tạo case theo mô hình Human-in-the-Loop (HITL) — admin nhận email kèm nút hành động, chọn playbook, SOAR thực thi trên Kubernetes.
+ZTLab là một **testbed thực nghiệm** hiện thực hoá các nguyên lý Zero Trust Architecture (NIST SP 800-207) trên một hệ thống microservices tài chính triển khai thật trên hai cloud (AWS + OpenStack), thay vì mô phỏng trên giấy hay chạy trên một cụm đơn lẻ. Luồng vận hành: user đăng nhập qua Keycloak OIDC/PKCE, mọi request qua API Gateway đều bị chặn bởi Envoy sidecar + OPA ext_authz trước khi tới ứng dụng, giao dịch được fraud-detection chấm điểm rủi ro (kèm tín hiệu device trust), rồi ghi nhận tại Core Banking trên OpenStack qua kết nối mTLS do SPIRE cấp phát. Log từ cả hai cloud đổ về PLG Stack (Promtail → Loki → Grafana); khi Grafana phát hiện 1 trong 5 mẫu hành vi tấn công đã định nghĩa, SOAR Engine tạo case theo mô hình Human-in-the-Loop (HITL) — admin nhận email kèm nút hành động, chọn playbook, SOAR thực thi trên Kubernetes.
 
 **Cần nói rõ ngay từ đầu:** đây không phải một sản phẩm bảo mật có thể cắm vào hệ thống khác để "tăng bảo mật, giảm tấn công" — toàn bộ policy OPA, alert rule Grafana, playbook SOAR đều viết cứng cho đúng tập endpoint/service của riêng hệ thống này, không tái sử dụng được nguyên trạng cho một hệ thống khác. Phần "Nguyên lý & phạm vi đóng góp" ngay bên dưới nói rõ giá trị thực sự của dự án nằm ở đâu.
 
@@ -14,7 +14,7 @@ Zero Trust là một tập nguyên lý rất rộng (identity, network, device, 
 
 Mô hình *perimeter-based* (kể cả bản nâng cấp bằng VPC/security group/VPN) đặt giả định: một khi request đã ở "bên trong" ranh giới mạng đã được xác thực (đã qua firewall, đã trong cùng VPC, đã qua VPN), các thực thể bên trong tin tưởng lẫn nhau theo mặc định — trust được cấp theo **vị trí mạng**, không theo **danh tính đã xác minh của từng request**. Với microservices, đây chính là lỗ hổng cấu trúc: nếu một service bị chiếm quyền (dependency độc hại, RCE, credential leak...), kẻ tấn công đã "ở trong ranh giới" và có thể gọi tự do sang service khác — *lateral movement* — mà không kiểm soát nào ở tầng perimeter phát hiện được, vì về bản chất traffic đó chưa từng "vượt biên giới" để bị soi.
 
-Zero Trust (cụ thể là NIST SP 800-207) nhắm thẳng vào đúng lỗ hổng này bằng cách bỏ hẳn khái niệm "network location = mức trust", thay bằng **identity verification + policy evaluation cho từng request, kể cả traffic nội bộ (east-west)** — kiến trúc chuẩn cho việc này là một **Policy Decision Point (PDP)** tách biệt (ở đây là OPA) đưa ra quyết định allow/deny, và **Policy Enforcement Point (PEP)** (Istio sidecar istio-proxy) là nơi thực thi quyết định đó tại chỗ, ngay cạnh workload. ZTLab không cố hiện thực hoá toàn bộ 7 tenet của SP 800-207 dàn trải — phạm vi thu hẹp có chủ đích vào các tenet có thể đo lường được bằng thực nghiệm: tenet 2 (secure communication regardless of location), tenet 3 + 6 (per-session/per-request authorization, enforced before access), và một phần tenet 4 (dynamic policy) — xem bảng ánh xạ đầy đủ bên dưới.
+Zero Trust (cụ thể là NIST SP 800-207) nhắm thẳng vào đúng lỗ hổng này bằng cách bỏ hẳn khái niệm "network location = mức trust", thay bằng **identity verification + policy evaluation cho từng request, kể cả traffic nội bộ (east-west)** — kiến trúc chuẩn cho việc này là một **Policy Decision Point (PDP)** tách biệt (ở đây là OPA) đưa ra quyết định allow/deny, và **Policy Enforcement Point (PEP)** (Envoy sidecar) là nơi thực thi quyết định đó tại chỗ, ngay cạnh workload. ZTLab không cố hiện thực hoá toàn bộ 7 tenet của SP 800-207 dàn trải — phạm vi thu hẹp có chủ đích vào các tenet có thể đo lường được bằng thực nghiệm: tenet 2 (secure communication regardless of location), tenet 3 + 6 (per-session/per-request authorization, enforced before access), và một phần tenet 4 (dynamic policy) — xem bảng ánh xạ đầy đủ bên dưới.
 
 ### Vì sao những lựa chọn thiết kế còn lại
 
@@ -23,7 +23,7 @@ Mỗi lựa chọn dưới đây là một điều kiện cần để câu hỏi
 - **Vì sao microservices, không phải monolith?** Lateral movement — vấn đề cốt lõi Zero Trust nhắm tới — không tồn tại trong một monolith (không có ranh giới mạng nội bộ để "di chuyển" qua). Microservices là điều kiện cần để có một bề mặt service-to-service thật sự cần kiểm chứng: nếu không có nhiều service độc lập gọi nhau qua mạng, câu hỏi "policy per-request có chặn được lateral movement không" không thể đặt ra.
 - **Vì sao domain tài chính (banking), không phải một API demo bất kỳ?** Ba lý do cộng dồn: (1) nghiệp vụ tài chính có cấu trúc RBAC tự nhiên (đọc/ghi, teller/admin) — khớp trực tiếp với mô hình phân quyền OPA cần kiểm thử; (2) giao dịch tài chính có một trục rủi ro *theo ngữ cảnh* (số tiền, kênh, tần suất) cho phép mở rộng Zero Trust vượt khỏi "ai được gọi service nào" (tầng identity/network) sang "hành động cụ thể này có nên được phép không" (tầng business logic — chính là fraud gate trong `fraud-detection`) — một cách hiện thực hoá tenet "dynamic policy" đầy đủ hơn phần lớn demo Zero Trust chỉ dừng ở tầng network; (3) ngành tài chính là nơi audit trail (tenet 7 — thu thập tối đa thông tin trạng thái để cải thiện an toàn) có giá trị compliance thật, không phải tính năng phụ.
 - **Vì sao hybrid multi-cloud (AWS + OpenStack), không phải một cloud/VPC?** Trong một cloud/VPC duy nhất, security group và IAM sẵn có của nhà cung cấp đã tạo ra một phần ranh giới tin cậy — rất khó tách bạch "cái gì do lớp Zero Trust tự xây tạo ra, cái gì do IAM/SG của cloud provider cho sẵn". Hai cloud có mô hình mạng và IAM khác hẳn nhau (AWS VPC quản lý vs OpenStack tự vận hành) buộc lớp Zero Trust (SPIFFE trust domain dùng chung 1 root CA, WireGuard nối tầng mạng, OPA policy nhất quán) phải tự chịu trách nhiệm toàn bộ việc thiết lập trust xuyên biên giới — cô lập đúng phần đóng góp của kiến trúc đang được kiểm chứng, không lẫn với hạ tầng có sẵn.
-- **Vì sao tự dựng VM + Terraform/Ansible/K3s, không dùng PaaS/SaaS quản lý sẵn (EKS+App Mesh, managed Istio, Auth0/Cognito...)?** Vì câu hỏi nghiên cứu chính là *chi phí vận hành thật của việc thêm lớp Zero Trust là bao nhiêu* (xem SYSTEM_EVALUATION.md) — nếu dùng dịch vụ quản lý sẵn, chính phần cần đo (latency OPA eval, chi phí cấp/xoay SVID, độ phức tạp giữ pipeline tái tạo được) sẽ nằm trong control plane đóng của nhà cung cấp, không đo được, không giải thích được. Tự dựng từng lớp (SPIRE server/agent, Istio service mesh, OPA) khiến mọi thứ minh bạch và đo được. Việc này cũng phản ánh gần hơn với thực tế triển khai của nhiều tổ chức tài chính có ràng buộc chủ quyền dữ liệu/pháp lý buộc phải giữ một phần hạ tầng tự vận hành (private cloud kiểu OpenStack) thay vì toàn bộ trên PaaS công cộng.
+- **Vì sao tự dựng VM + Terraform/Ansible/K3s, không dùng PaaS/SaaS quản lý sẵn (EKS+App Mesh, managed Istio, Auth0/Cognito...)?** Vì câu hỏi nghiên cứu chính là *chi phí vận hành thật của việc thêm lớp Zero Trust là bao nhiêu* (xem SYSTEM_EVALUATION.md) — nếu dùng dịch vụ quản lý sẵn, chính phần cần đo (latency OPA eval, chi phí cấp/xoay SVID, độ phức tạp giữ pipeline tái tạo được) sẽ nằm trong control plane đóng của nhà cung cấp, không đo được, không giải thích được. Tự dựng từng lớp (SPIRE server/agent, Envoy sidecar, OPA) khiến mọi thứ minh bạch và đo được. Việc này cũng phản ánh gần hơn với thực tế triển khai của nhiều tổ chức tài chính có ràng buộc chủ quyền dữ liệu/pháp lý buộc phải giữ một phần hạ tầng tự vận hành (private cloud kiểu OpenStack) thay vì toàn bộ trên PaaS công cộng.
 - **Vì sao NIST SP 800-207, không phải Forrester ZTX hay BeyondCorp?** SP 800-207 là chuẩn liên bang Mỹ, trung lập vendor, được CISA và DoD Zero Trust Reference Architecture dẫn chiếu làm nền — khác với các khung thương mại (Forrester ZTX là sản phẩm tư vấn) hay case study riêng của một hãng (BeyondCorp mô tả triển khai nội bộ của Google, không phải chuẩn tổng quát). Quan trọng hơn: SP 800-207 định nghĩa Zero Trust bằng **tenet** (thuộc tính hệ thống phải có) chứ không quy định sản phẩm cụ thể — cho phép kiểm chứng theo kiểu "hệ thống có đạt tenet X hay không" một cách khách quan, thay vì đối chiếu với tiêu chí mơ hồ.
 
 ### Khác gì so với các tính năng Zero Trust có sẵn trên cloud
@@ -39,16 +39,16 @@ Cả AWS, GCP, Azure đều bán sản phẩm gắn mác "Zero Trust" — cần 
 
 ### Zero Trust áp dụng ở lớp nào, và ZTLab có phải "khung giải pháp mới" không
 
-**Không.** ZTLab không đề xuất một mô hình Zero Trust mới — nó là một **hiện thực hoá cụ thể** của SP 800-207 bằng các thành phần mã nguồn mở sẵn có (SPIFFE/SPIRE, OPA, Istio, Grafana, một SOAR tự viết), áp dụng có chọn lọc, không đều, lên 7 tenet gốc:
+**Không.** ZTLab không đề xuất một mô hình Zero Trust mới — nó là một **hiện thực hoá cụ thể** của SP 800-207 bằng các thành phần mã nguồn mở sẵn có (SPIFFE/SPIRE, OPA, Envoy, Grafana, một SOAR tự viết), áp dụng có chọn lọc, không đều, lên 7 tenet gốc:
 
 | # | Tenet (NIST SP 800-207) | ZTLab có làm không | Bằng gì |
 |---|---|---|---|
 | 1 | *All data sources and computing services are considered resources* | Một phần | OPA phân biệt `internal_service_request` (có SVID) vs `external_api_request` (không SVID) theo **danh tính đã xác minh** (identity), không theo IP/network location — đúng tinh thần tenet, nhưng vẫn là một dạng phân loại request, không xử lý "mọi resource hoàn toàn như nhau" |
-| 2 | *All communication is secured regardless of network location* | Có | mTLS bắt buộc mọi service-to-service qua Istio (PeerAuthentication STRICT) + SPIRE SVID, kể cả cross-cloud qua WireGuard tunnel |
+| 2 | *All communication is secured regardless of network location* | Có | mTLS bắt buộc mọi service-to-service qua Envoy + SPIRE SVID, kể cả cross-cloud qua WireGuard tunnel |
 | 3 | *Access to resources is granted on a per-session basis* | Có | SVID TTL 1 giờ, auto-rotate; mỗi request đi qua OPA ext_authz riêng biệt — không có khái niệm "authenticated once, trusted thereafter" |
 | 4 | *Access determined by dynamic policy* (identity, app, asset, behavioral attributes) | Một phần | OPA dùng role (RBAC) + trạng thái SVID; fraud-detection mở rộng thêm behavioral attribute (amount/channel/velocity) cho riêng luồng giao dịch — nhưng chưa có device posture/health attestation |
 | 5 | *Monitor and measure the integrity/security posture of all assets* | Một phần | `security-scanner-job.yaml` kiểm tra container posture (uid, Linux capabilities), giờ đã nối vào pipeline detection→response thật (`privilege-escalation-alert.yml` → SOAR case `privilege_escalation`, playbook `quarantine_workload`, xác nhận 2026-08-20) — nhưng vẫn chỉ *phát hiện sau khi đã chạy*, chưa *ngăn tạo* container vi phạm ngay từ đầu (cần K8s admission control, chưa có) |
-| 6 | *Authentication/authorization are dynamic and strictly enforced before access* | Có | Istio CUSTOM AuthorizationPolicy → OPA ext_authz, mặc định fail-closed khi OPA lỗi/timeout — xác nhận thật bằng cách tắt hẳn opa-server và gửi traffic qua Traefik (không phải port-forward, xem lưu ý ở FLOW_DETAIL.md §2.3): response vẫn 403 từ istio-envoy |
+| 6 | *Authentication/authorization are dynamic and strictly enforced before access* | Có | `failure_mode_allow: false` ở Envoy ext_authz — OPA lỗi/timeout thì deny, không fail-open |
 | 7 | *Collect information on assets/network state to improve security posture* | Có | PLG Stack + audit log OPA (`decision_id` riêng từng decision) + SOAR case log — dùng để detect, respond, và điều chỉnh policy (ví dụ: incident lệch JWT issuer ngày 2026-08-13, fix bằng chuyển sang OIDC discovery thay vì hardcode) |
 
 Diễn giải bảng trên bằng một câu: ZTLab làm tốt các tenet thuộc phạm trù *identity + network + policy enforcement* (2, 3, 6, một phần 4), còn tenet thuộc phạm trù *device/asset posture* (5) mới dừng ở mức thủ công/one-off — đây không phải sơ suất che giấu mà là ranh giới phạm vi có chủ đích của một đồ án quy mô lab, đã nói rõ ở phần "ZTLab đóng góp gì" bên dưới.
@@ -67,7 +67,7 @@ flowchart LR
     end
     subgraph ZT["Triển khai trong ZTLab"]
         direction TB
-        I1["SPIRE SVID X.509 + Istio mTLS<br/>bắt buộc mọi service-to-service"]
+        I1["SPIRE SVID X.509 + Envoy mTLS<br/>bắt buộc mọi service-to-service"]
         I2["OPA ext_authz (Rego)<br/>kiểm JWT + RBAC + SVID mỗi request"]
         I3["NetworkPolicy theo namespace +<br/>OPA fraud gate theo giao dịch"]
         I4["PLG Stack + SOAR HITL<br/>phát hiện & phản ứng tự động"]
@@ -89,7 +89,7 @@ Cần tách bạch hai loại tuyên bố dễ bị nhầm lẫn với nhau:
 
 Vậy giá trị thực của dự án nằm ở đâu, nếu không phải "giảm tấn công"? Ba điểm, xếp theo mức độ chắc chắn giảm dần:
 
-**1. Bằng chứng thực nghiệm về operational feasibility — và về cái giá thật của nó.** Cần nói chính xác: đóng góp **không phải** "ZTLab là một hệ thống chạy được" — bản thân một artifact chạy được không phải kết quả nghiên cứu, và trên thực tế pipeline này **không** tự chạy trơn tru qua các lần destroy/redeploy (xem Mục 0, SYSTEM_EVALUATION.md: 4 lỗi cụ thể — race condition với cloud-init, SSH host-key sau khi VM đổi, resource K8s bị thiếu khiến SOAR treo, sai `client_id` Keycloak ở 4 script test — chỉ lộ ra khi dựng lại từ số 0, không lộ ra khi chỉnh sửa nhỏ trên cluster đang chạy). Đóng góp thật nằm ở **quá trình lặp lại thực nghiệm đó**: lắp SPIFFE/SPIRE (workload identity) + OPA (policy-as-code, đóng vai Policy Decision Point) + Istio service mesh (Policy Enforcement Point) + PLG stack/SOAR (vòng lặp detect–respond) thành một pipeline xuyên hai cloud có mô hình mạng/IAM hoàn toàn khác nhau, rồi *đo lại chính xác nó gãy ở đâu và vì sao* mỗi lần dựng lại từ số 0 — đây là dữ liệu về chi phí kỹ sư thật của Zero Trust mà phần lớn tài liệu SP 800-207 (vốn dừng ở mức nguyên lý trừu tượng) không đề cập tới.
+**1. Bằng chứng thực nghiệm về operational feasibility — và về cái giá thật của nó.** Cần nói chính xác: đóng góp **không phải** "ZTLab là một hệ thống chạy được" — bản thân một artifact chạy được không phải kết quả nghiên cứu, và trên thực tế pipeline này **không** tự chạy trơn tru qua các lần destroy/redeploy (xem Mục 0, SYSTEM_EVALUATION.md: 4 lỗi cụ thể — race condition với cloud-init, SSH host-key sau khi VM đổi, resource K8s bị thiếu khiến SOAR treo, sai `client_id` Keycloak ở 4 script test — chỉ lộ ra khi dựng lại từ số 0, không lộ ra khi chỉnh sửa nhỏ trên cluster đang chạy). Đóng góp thật nằm ở **quá trình lặp lại thực nghiệm đó**: lắp SPIFFE/SPIRE (workload identity) + OPA (policy-as-code, đóng vai Policy Decision Point) + Envoy sidecar (Policy Enforcement Point) + PLG stack/SOAR (vòng lặp detect–respond) thành một pipeline xuyên hai cloud có mô hình mạng/IAM hoàn toàn khác nhau, rồi *đo lại chính xác nó gãy ở đâu và vì sao* mỗi lần dựng lại từ số 0 — đây là dữ liệu về chi phí kỹ sư thật của Zero Trust mà phần lớn tài liệu SP 800-207 (vốn dừng ở mức nguyên lý trừu tượng) không đề cập tới.
 
 **2. Số liệu chi phí runtime thật, thay vì ước lượng lý thuyết.** Câu hỏi "áp Zero Trust thì tốn thêm bao nhiêu mỗi request?" thường chỉ được trả lời định tính trong tài liệu tham khảo. SYSTEM_EVALUATION.md đưa ra con số đo được cụ thể cho *chính kiến trúc này* (không suy rộng ra kiến trúc khác được): overhead latency ở lớp JWT+OPA (per-request), overhead CPU/RAM của SPIRE/OPA/SOAR so với phần còn lại của cluster (steady-state, khác với chi phí *dựng lại* pipeline đã nói ở điểm 1). Đây là loại dữ liệu hữu ích cho người *đang cân nhắc* áp dụng một kiến trúc tương tự, để so sánh đánh đổi — không phải bằng chứng "hệ thống nào có Zero Trust thì an toàn hơn hệ thống không có".
 
@@ -109,7 +109,7 @@ flowchart LR
         direction TB
         KC["Keycloak<br/>OIDC/PKCE · RS256 JWT"]
         WP["web-portal"]
-        AG["api-gateway<br/>Istio sidecar + OPA ext_authz"]
+        AG["api-gateway<br/>Envoy sidecar + OPA ext_authz"]
         PS["payment-service"]
         FD["fraud-detection<br/>Redis velocity"]
         WP --> KC
@@ -149,7 +149,7 @@ flowchart LR
 
 **Stack:**
 - **Identity:** Keycloak OIDC/PKCE, SPIFFE/SPIRE X.509 SVIDs (trust domain `ztlab.local`, gia hạn ~30 phút)
-- **Policy:** Istio sidecar (istio-proxy) + OPA ext_authz gRPC (CUSTOM AuthorizationPolicy) — JWT verify, RBAC, fraud gate, SVID check
+- **Policy:** Envoy sidecar + OPA ext_authz gRPC — JWT verify, RBAC, fraud gate, SVID check
 - **Services:** FastAPI microservices trên K3s (AWS + OpenStack), Redis, PostgreSQL
 - **Observability:** Promtail → Loki → Grafana (5 alert rules thật, gửi webhook mỗi 1 phút khi fire)
 - **Security Ops:** SOAR Engine — HITL, 5 playbooks, email HITL với action buttons, dedup 5 phút/attack_type
@@ -164,7 +164,7 @@ ansible/            Inventory + playbooks cấu hình nodes
 k8s/                Kubernetes manifests (financial, identity, plg-stack, monitoring)
 opa/policies/       Rego: zta_policy (JWT, RBAC, fraud gate, SVID)
 spire/              SPIRE server/agent configs + K8s manifests
-k8s/istio/          Istio install config (IstioOperator, mTLS, OPA ext_authz provider)
+envoy/              Envoy sidecar configmap (mTLS, OPA ext_authz)
 services/           FastAPI microservices source code
 shared/             Python shared modules (logging, metrics)
 monitoring/         Prometheus scrape config
@@ -207,7 +207,7 @@ Hướng dẫn cài đặt từng bước thủ công (dùng khi debug hoặc mu
 ## Bắt đầu nhanh
 
 ```bash
-bash scripts/deploy-all.sh             # dựng hạ tầng + deploy toàn bộ từ số 0 (idempotent, chạy lại an toàn)
+bash scripts/deploy-all.sh             # dựng hạ tầng + deploy toàn bộ từ số 0
 bash scripts/destroy-all.sh            # gỡ hạ tầng khi cần dừng/dựng lại sạch
 
 bash scripts/k8s-tunnel.sh up all      # mở tunnel tới 2 cluster
@@ -222,7 +222,8 @@ bash scripts/run-demo.sh               # normal traffic + 4 kịch bản tấn c
 
 | Service | URL | Credential |
 |---------|-----|------------|
-| Web Portal | http://localhost:18081 | testuser01 / Test1234! (Keycloak SSO) |
+| Web Portal | http://localhost:18081 | testuser01 / 
+Test1234! (Keycloak SSO) |
 | API Gateway | http://localhost:18080 | JWT Bearer |
 | Keycloak Admin | http://localhost:8180 | admin / ztlab-admin-2026 |
 | Grafana | http://localhost:3000 | admin / ZTALab2026! |
@@ -251,13 +252,13 @@ bash scripts/run-demo.sh               # normal traffic + 4 kịch bản tấn c
 
 Có **hai bộ script khác cơ chế** cho cùng các kịch bản — cần phân biệt rõ, không đánh đồng:
 
-- **`tests/grafana_kb{1,2,3,5}_*.sh`** — tạo **traffic thật**, lấy `response_code` thật từ hệ thống. **Lưu ý quan trọng** (phát hiện 2026-08-23): KB1/KB2/KB5 gọi api-gateway qua `kubectl port-forward`, một con đường vô tình bỏ qua lớp Istio/OPA phía trước api-gateway (chi tiết + cách test đúng qua Traefik: [FLOW_DETAIL.md](FLOW_DETAIL.md) §2.3) — 3 script này verify được lớp app-level thật (JWT decode, fraud gate, role check), không verify được lớp Istio/OPA. Chỉ KB3 (dùng `kubectl exec` service-to-service thật) verify đúng cả 2 lớp. Lớp Istio/OPA đã được verify riêng, đúng cách, qua `tests/chaos_opa_failover.sh`.
+- **`tests/grafana_kb{1,2,3,5}_*.sh`** — tạo **traffic thật**, đi qua đúng enforcement point thật (Envoy/OPA/api-gateway), lấy `response_code` thật từ hệ thống. Đây là bằng chứng enforcement hoạt động.
 - **`scripts/run-demo.sh --kb{1,2,3,4}`** — **đẩy thẳng dòng log giả lập vào Loki** (không gọi request thật, không đi qua enforcement point nào) để trình diễn nhanh phần detection→SOAR (Grafana fire → case → email HITL) mà không cần chờ traffic thật tích luỹ. Hữu ích để demo luồng phản ứng, **không phải bằng chứng enforcement** — enforcement đã được xác nhận riêng bằng bộ script `tests/grafana_kb*.sh` ở trên.
 - **`k8s/financial/security-scanner-job.yaml`** — Job kiểm tra posture container, chạy độc lập qua `kubectl apply`, ghi log AUDIT thật.
 
 | Tên | ATT&CK | Enforcement thật (đã xác nhận qua traffic/log thật) | Phát hiện Grafana | SOAR Playbook |
 |-----|--------|------------------|-------------------|----------------|
-| Brute Force Login | T1110.001 | Token không đúng cấu trúc JWT → api-gateway tự decode lỗi → 401 `event=jwt_verification_failed` (không phải Keycloak login — xem [FLOW_DETAIL.md](FLOW_DETAIL.md) §4 về vì sao không phải OPA/Istio cho đường test này) | `brute-force-alert.yml` | revoke_user_sessions |
+| Brute Force Login | T1110.001 | Token không đúng cấu trúc JWT → OPA `valid_jwt` fail → Envoy 403 (**không** phải Keycloak login, không phải lỗi 401 ở tầng app — xem [FLOW_DETAIL.md](FLOW_DETAIL.md) §4) | `brute-force-alert.yml` | revoke_user_sessions |
 | Lateral Movement | T1021.007 | Service có **SVID hợp lệ thật** (`notification-service`) gọi path nội bộ không nằm trong whitelist OPA của `payment-service` → 403 (**không** phải SVID giả — xem §6) | `lateral-movement-alert.yml` | isolate_workload |
 | Fraud Gate Bypass | T1078.004 | fraud-detection chấm điểm giao dịch 500M/kênh tor = 75 điểm ≥ ngưỡng → payment-service tự chặn, không gọi core-banking (403) | `fraud-gate-bypass-alert.yml` | isolate_workload |
 | Data Exfiltration | T1041 | (chỉ kiểm thử qua `run-demo.sh --kb4` — log giả lập `bytes_sent` > 1 MiB, chưa có phiên bản traffic thật) | `large-response-alert.yml` | restrict_egress |
@@ -291,8 +292,8 @@ Chi tiết vận hành/redeploy: xem **[DEPLOY.md](DEPLOY.md)**.
 
 | Log | Lệnh xem | Ý nghĩa |
 |-----|----------|---------|
-| istio-proxy access | `kubectl logs -n financial deploy/api-gateway -c istio-proxy` | source_ip, response_code, bytes_sent, svid |
+| Envoy access | `kubectl logs -n financial deploy/api-gateway -c envoy` | source_ip, response_code, bytes_sent, svid |
 | OPA decision | `kubectl logs -n financial deploy/opa-server` | result=true/false, path, input attributes |
 | SPIRE agent | `kubectl logs -n spire daemonset/spire-agent` | SVID renewal mỗi ~30 phút |
 | SOAR cases | `curl http://localhost:8091/cases` | attack_type, severity, source_ip, status |
-| Grafana Loki | http://localhost:3000 → Explore | Query: `{job="envoy-access"} \| json \| response_code=401` (log của istio-proxy, không phải Envoy hand-rolled) |
+| Grafana Loki | http://localhost:3000 → Explore | Query: `{job="envoy-access"} \| json \| response_code=401` |
