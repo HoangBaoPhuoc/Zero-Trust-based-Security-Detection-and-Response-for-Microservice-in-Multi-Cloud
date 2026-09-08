@@ -52,21 +52,16 @@ spec:
         - port: 8181
           protocol: TCP
 
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: financial
-      ports:
-        - port: 8080
-          protocol: TCP
-        - port: 15006
-          protocol: TCP
-        - port: 9191
-          protocol: TCP
-        - port: 5432
-          protocol: TCP
-        - port: 6379
-          protocol: TCP
+    # T-3.1 (2026-09-05): trước đây có 1 rule ở đây cho phép TOÀN BỘ namespace
+    # "financial" gọi port 8080/15006/9191/5432/6379 — nghĩa là bất kỳ pod nào
+    # cũng gọi được bất kỳ pod nào khác trong cùng namespace (mọi service, cả
+    # Redis, cả OPA), không có phân đoạn thật ở tầng L4 dù L7 (OPA/service_acl,
+    # T-1.1) đã đúng. Rule đó đã bị XOÁ, thay bằng NetworkPolicy pod-level
+    # riêng cho từng đích trong aws-pod-segmentation.yaml, dựa đúng ma trận
+    # traffic thật đã đo ở T-1.1 (không suy đoán). Port 5432 (Postgres) không
+    # còn trong ma trận: xác nhận grep code — không service nào ở AWS
+    # financial namespace dùng Postgres trực tiếp (Postgres chỉ tồn tại ở
+    # OpenStack, account-service/transaction-service).
     # SOAR engine (plg-stack) → Redis (financial) for case persistence
     - from:
         - namespaceSelector:

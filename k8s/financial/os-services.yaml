@@ -47,6 +47,20 @@ spec:
         sidecar.istio.io/userVolumeMount: '[{"name":"spire-workload-socket","mountPath":"/var/run/secrets/workload-spiffe-uds/socket"}]'
     spec:
       serviceAccountName: core-banking
+      # T-1.5: core-banking verifies fraud-detection's verdict signature via
+      # the SPIRE trust bundle instead of a shared HMAC secret (see
+      # fraud-detection's Deployment in aws-services.yaml for why this needs
+      # its own file-writer sidecar rather than a Workload API client lib).
+      initContainers:
+        - name: svid-init
+          image: ghcr.io/spiffe/spire-agent:1.9.4
+          command: ["/opt/spire/bin/spire-agent", "api", "fetch", "x509",
+                    "-socketPath", "/run/spire/sockets/agent.sock", "-write", "/svid"]
+          volumeMounts:
+            - name: spire-socket
+              mountPath: /run/spire/sockets
+            - name: svid
+              mountPath: /svid
       containers:
         - name: core-banking
           image: ztlab/core-banking:1.0.0
@@ -64,11 +78,10 @@ spec:
               value: "http://account-service.financial.svc.cluster.local:8080"
             - name: TRANSACTION_SERVICE_URL
               value: "http://transaction-service.financial.svc.cluster.local:8080"
-            - name: CORE_BANKING_SHARED_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: core-banking-integrity-secret
-                  key: shared-secret
+          volumeMounts:
+            - name: svid
+              mountPath: /svid
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -88,6 +101,21 @@ spec:
             limits:
               cpu: 200m
               memory: 128Mi
+      # No periodic refresh sidecar -- see the long comment on this exact
+      # point in fraud-detection's Deployment (aws-services.yaml): two
+      # different approaches to a fetch-and-exit refresh sidecar both zeroed
+      # out the Service's endpoints on a live test there. svid-init above
+      # only fetches once at pod start; the trust bundle it writes is also
+      # what's used to verify fraud-detection's SVID (bundle.0.pem), and it
+      # will go stale on the same ~1h timeline. Known gap, see
+      # KET-QUA-KIEM-TRA.md T-1.5.
+      volumes:
+        - name: spire-socket
+          hostPath:
+            path: /run/spire/sockets
+            type: Directory
+        - name: svid
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

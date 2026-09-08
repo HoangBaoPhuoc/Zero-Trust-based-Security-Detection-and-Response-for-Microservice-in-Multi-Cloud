@@ -4,84 +4,80 @@ import future.keywords.if
 import future.keywords.in
 
 default allow = false
-default allow_cross_cloud = false
 
-# Specific cross-cloud relationship: payment-service (AWS) -> core-banking (OpenStack)
-allow_cross_cloud if {
-  input.attributes.source.principal == "spiffe://ztlab.local/aws/payment-service"
-  input.attributes.destination.principal == "spiffe://ztlab.local/openstack/core-banking"
+source_principal      := object.get(input.attributes.source, "principal", "")
+destination_principal := object.get(input.attributes.destination, "principal", "")
+method                 := input.attributes.request.http.method
+path                   := input.attributes.request.http.path
+headers                := object.get(input.attributes.request.http, "headers", {})
+
+# Ma trận phân quyền — T-3.2: sinh từ policy/service-graph.yaml (nguồn sự
+# thật duy nhất, dùng chung với zta_policy.rego) — xem
+# opa/policies/service_acl.rego (generated) + scripts/gen-rego-acl.py. Không
+# định nghĩa tay ở đây nữa, tránh lệch giữa 2 file như trước T-3.2.
+#
+# Lịch sử: trước đây có một rule "OpenStack-internal: bất kỳ workload OS nào
+# gọi bất kỳ workload OS nào khác (trừ /admin)" — SỐNG THẬT trên cluster
+# OpenStack (opa-config.yaml của os-security.yaml trỏ path này). Thay bằng
+# ma trận cụ thể ở T-1.1 (KET-QUA-KIEM-TRA.md, đính chính T-0.6).
+service_acl := data.zta.generated.service_acl
+
+allowed_by_acl if {
+  allowed_paths := service_acl[source_principal][destination_principal][method]
+  some p in allowed_paths
+  startswith(path, p)
 }
 
-# Cross-cloud ingress: payment-service (AWS) proxies both transaction execution
-# AND account management to core-banking (see services/payment-service/main.py:
-# POST/GET /accounts, GET /accounts/{id}, GET /transactions, POST
-# /transactions/execute — all forwarded to CORE_BANKING_URL). Originally this
-# rule only covered "/transactions", which silently 403'd every account
-# lookup/creation call (empty-body ext_authz deny, response_time ~1-4ms,
-# upstream: null in istio-proxy access log) — found 2026-08-23 while
-# investigating "chuyển khoản không thành công": first-login auto account
-# creation always failed, so users had 0 accounts and transfer had nothing
-# to transfer from.
-# /transactions/execute is real money movement — the one path Device
-# Posture (T5) is meant to gate. Found 2026-08-23: this path is reached via
-# THIS package (zta.crosscloud), not zta.authz — the `posture_compliant`
-# rule already written in zta_policy.rego's core_transaction_with_fraud_gate
-# never actually ran for this real call, so the X-Device-Posture header
-# payment-service now attaches (shared/posture.py) was arriving at OPA but
-# not being checked by whichever rule actually decides this request. Split
-# out so posture only gates the execute path, not account/history lookups.
+# /transactions/execute là tiền thật — gate thêm bằng fraud-gate VÀ posture.
+# Trước đây rule này (duy nhất áp cho path thật) chỉ kiểm posture_compliant,
+# KHÔNG kiểm fraud_gate_valid như zta_policy.rego có làm cho path tương ứng
+# — lệch giữa 2 PDP. core-banking (services/core-banking/main.py:58-92) có
+# tự kiểm HMAC fraud-gate độc lập nên không phải lỗ hổng khai thác được,
+# nhưng PDP nên chặn trước khi tới app (defense-in-depth) — thêm lại đây.
 allow if {
-  input.attributes.source.principal == "spiffe://ztlab.local/aws/payment-service"
-  input.attributes.destination.principal == "spiffe://ztlab.local/openstack/core-banking"
-  input.attributes.request.http.method == "POST"
-  input.attributes.request.http.path == "/transactions/execute"
+  allowed_by_acl
+  method == "POST"
+  path == "/transactions/execute"
+  fraud_gate_valid
   posture_compliant
+  device_trust_compliant
 }
 
 allow if {
-  input.attributes.source.principal == "spiffe://ztlab.local/aws/payment-service"
-  input.attributes.destination.principal == "spiffe://ztlab.local/openstack/core-banking"
-  input.attributes.request.http.method in ["GET", "POST"]
-  startswith(input.attributes.request.http.path, "/transactions")
-  input.attributes.request.http.path != "/transactions/execute"
+  allowed_by_acl
+  method in ["GET", "POST"]
+  path != "/transactions/execute"
+}
+
+fraud_gate_valid if {
+  headers["x-fraud-gate"] == "passed"
+  to_number(headers["x-fraud-score"]) < 75
 }
 
 # Additive: caller not yet updated to send the header (any other internal
 # hop) is unaffected — only an explicit "non-compliant" value denies.
 posture_compliant if {
-  not input.attributes.request.http.headers["x-device-posture"]
+  not headers["x-device-posture"]
 }
 
 posture_compliant if {
-  input.attributes.request.http.headers["x-device-posture"] == "compliant"
+  headers["x-device-posture"] == "compliant"
 }
 
-allow if {
-  input.attributes.source.principal == "spiffe://ztlab.local/aws/payment-service"
-  input.attributes.destination.principal == "spiffe://ztlab.local/openstack/core-banking"
-  input.attributes.request.http.method in ["GET", "POST"]
-  startswith(input.attributes.request.http.path, "/accounts")
+# T-4.1: device_trust (thiết bị/trình duyệt NGƯỜI DÙNG CUỐI đăng nhập, khác
+# posture_compliant ở trên là posture của chính WORKLOAD gọi). Trước đây
+# device_trust chỉ cộng điểm rủi ro trong fraud-detection, không bao giờ tới
+# PDP — payment-service giờ relay qua header X-Device-Trust (cùng pattern
+# X-Device-Posture). Additive giống posture_compliant: caller không gửi
+# header (chưa cập nhật) thì coi như không áp dụng, không phá traffic khác —
+# chỉ "suspicious" (User-Agent rỗng/bot, xem web-portal/main.py) mới bị chặn
+# hẳn ở đây; "new_device"/"unknown" vẫn qua PDP, chỉ cộng điểm rủi ro ở
+# fraud-detection (chưa đủ căn cứ để chặn cứng một thiết bị CHỈ VÌ mới thấy
+# lần đầu — xem T-4.2 cho hướng step-up thay vì chặn cứng).
+device_trust_compliant if {
+  not headers["x-device-trust"]
 }
 
-# Cross-cloud: api-gateway (AWS) manages accounts and reads transaction
-# history on OpenStack (account lookup/creation at login, balance, history).
-allow if {
-  input.attributes.source.principal == "spiffe://ztlab.local/aws/api-gateway"
-  input.attributes.destination.principal in {
-    "spiffe://ztlab.local/openstack/account-service",
-    "spiffe://ztlab.local/openstack/transaction-service",
-  }
-  input.attributes.request.http.method in ["GET", "POST"]
-  not denied_path
-}
-
-# OpenStack-internal: any OS workload may call another OS service (no /admin)
-allow if {
-  startswith(input.attributes.source.principal, "spiffe://ztlab.local/openstack/")
-  input.attributes.request.http.method in ["GET", "POST", "PUT", "OPTIONS"]
-  not denied_path
-}
-
-denied_path if {
-  startswith(input.attributes.request.http.path, "/admin")
+device_trust_compliant if {
+  headers["x-device-trust"] != "suspicious"
 }

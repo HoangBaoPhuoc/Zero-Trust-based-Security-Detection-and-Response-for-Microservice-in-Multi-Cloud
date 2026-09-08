@@ -55,6 +55,15 @@ spec:
               mountPath: /run/spire/sockets
             - name: spire-token
               mountPath: /var/run/secrets/tokens
+            # T-2.1: bỏ insecure_bootstrap/skip_kubelet_verification — 2 mount
+            # dưới đây là những gì agent.conf giờ cần để tự xác minh (xem
+            # spire/agent/{aws,os}-agent.conf).
+            - name: spire-bundle
+              mountPath: /run/spire/bundle
+              readOnly: true
+            - name: kubelet-ca
+              mountPath: /run/spire/kubelet-ca/server-ca.crt
+              readOnly: true
       volumes:
         - name: spire-config
           configMap:
@@ -73,4 +82,21 @@ spec:
                   path: spire-agent
                   expirationSeconds: 7200
                   audience: spire-server
+        # Root CA của hệ thống (spire/root-ca/ca.crt) — agent dùng để verify
+        # server khi bootstrap thay vì insecure_bootstrap. Cùng 1 ConfigMap,
+        # cùng nội dung, cho cả 2 cluster (server.conf của cả 2 cluster dùng
+        # chung UpstreamAuthority này — xác nhận 2026-09-05).
+        - name: spire-bundle
+          configMap:
+            name: spire-bundle
+            items:
+              - key: ca.crt
+                path: bootstrap.crt
+        # CA nội bộ của chính k3s trên node này — ký serving cert của kubelet
+        # (xác nhận 2026-09-05, cả AWS lẫn OpenStack). Có sẵn trên mọi node,
+        # không cần phân phối gì thêm.
+        - name: kubelet-ca
+          hostPath:
+            path: /var/lib/rancher/k3s/agent/server-ca.crt
+            type: File
 

@@ -26,6 +26,14 @@ data:
 # (missing a live policy fix from 2026-08-13) because this file is applied
 # AFTER the --from-file step in deploy_financial_services, silently reverting
 # the fix on every full deploy-app.sh run. Do not re-add an embedded copy.
+# T-5.4 (mở rộng sang OpenStack): opa-server bên AWS đã đo thật cái giá của
+# replicas:1 + failure_mode_allow:false (KET-QUA-KIEM-TRA.md T-5.4 — xoá pod
+# duy nhất gây ~5.6s mất dịch vụ 100%, chuyển sang 3 replica + PDB loại bỏ
+# hoàn toàn cửa sổ đó khi mất 1 pod đơn lẻ). OPA bên OpenStack (phục vụ
+# core-banking/account-service/transaction-service qua zta/crosscloud/allow)
+# là cùng một kiến trúc PDP tập trung fail-closed, cùng rủi ro F10 — áp dụng
+# cùng fix để nhất quán, không đo lại riêng (kết luận suy ra hợp lý từ cùng
+# cấu hình OPA, cùng failure_mode_allow:false).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,7 +42,7 @@ metadata:
   labels:
     app: opa
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: opa
@@ -48,7 +56,8 @@ spec:
       serviceAccountName: opa
       containers:
         - name: opa
-          image: openpolicyagent/opa:latest-envoy
+          # Pinned 2026-09-05 from the digest actually running (was latest-envoy, a floating tag — see KET-QUA-KIEM-TRA.md T-0.5).
+          image: openpolicyagent/opa@sha256:1792991ca9646526b8c95c59cbb525ce33bf78458800182d78f6fa884d5ec517
           args:
             - "run"
             - "--server"
@@ -94,6 +103,19 @@ spec:
         - name: opa-policies
           configMap:
             name: opa-policies
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: opa-server
+  namespace: financial
+  labels:
+    app: opa
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: opa
 ---
 apiVersion: v1
 kind: Service

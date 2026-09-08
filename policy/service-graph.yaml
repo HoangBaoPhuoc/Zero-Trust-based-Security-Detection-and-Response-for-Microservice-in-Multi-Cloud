@@ -1,0 +1,146 @@
+# NGUỒN SỰ THẬT DUY NHẤT cho phân đoạn 2 tầng (T-3.2, KE-HOACH-SUA-HE-THONG.md).
+#
+# Sinh ra 2 thứ, PHẢI khớp nhau vì cùng đọc từ đây:
+#   - L7 (Rego, theo SPIFFE ID)  <- scripts/gen-rego-acl.py      -> opa/policies/service_acl.rego
+#   - L4 (NetworkPolicy, theo pod) <- scripts/gen-networkpolicy.py -> k8s/financial/network-policies/{aws,os}-pod-segmentation.yaml
+#
+# KHÔNG sửa tay 2 file generated đó — sửa ở đây rồi chạy lại 2 script trên.
+#
+# Dữ liệu lấy từ traffic THẬT đo được ở T-1.1 (chạy scripts/run-demo.sh
+# --traffic-only, xem decision log OPA), xác nhận bởi người dùng (gate G5,
+# KET-QUA-KIEM-TRA.md). Không suy đoán.
+#
+# LƯU Ý QUAN TRỌNG (T-3.1, 2026-09-05): NetworkPolicy sinh ra từ file này
+# hiện KHÔNG được kube-router enforce cho traffic đi qua Istio sidecar trên
+# hạ tầng k3s+iptables-nft đang dùng (xem KET-QUA-KIEM-TRA.md §T-3.1) — mọi
+# traffic nghiệp vụ thật đều có sidecar. File L4 sinh ra vẫn ĐÚNG về mặt khai
+# báo/ý định và có giá trị tài liệu hoá + sẽ hoạt động đúng nếu hạ tầng CNI
+# thay đổi trong tương lai, nhưng KHÔNG coi là lớp bảo vệ đang hoạt động thật
+# — L7 (service_acl.rego) mới là lớp phân đoạn thật đang chạy đúng.
+
+trust_domain: ztlab.local
+
+workloads:
+  aws/web-portal:            { cluster: aws, namespace: financial, service_account: web-portal }
+  aws/api-gateway:            { cluster: aws, namespace: financial, service_account: api-gateway }
+  aws/payment-service:        { cluster: aws, namespace: financial, service_account: payment-service }
+  aws/fraud-detection:        { cluster: aws, namespace: financial, service_account: fraud-detection }
+  aws/notification-service:   { cluster: aws, namespace: financial, service_account: notification-service }
+  aws/redis:                  { cluster: aws, namespace: financial, app_label: redis, spiffe: false }
+  aws/opa:                    { cluster: aws, namespace: financial, app_label: opa, spiffe: false }
+  openstack/core-banking:            { cluster: openstack, namespace: financial, service_account: core-banking }
+  openstack/account-service:         { cluster: openstack, namespace: financial, service_account: account-service }
+  openstack/transaction-service:     { cluster: openstack, namespace: financial, service_account: transaction-service }
+  openstack/postgres-accounts:       { cluster: openstack, namespace: financial, app_label: postgres-accounts, spiffe: false }
+  openstack/postgres-txn:            { cluster: openstack, namespace: financial, app_label: postgres-txn, spiffe: false }
+  openstack/opa:                     { cluster: openstack, namespace: financial, app_label: opa, spiffe: false }
+
+# edges nghiệp vụ thật (L7 + L4, cùng cluster -> podSelector; khác cluster ->
+# đã có ipBlock riêng trong aws-allow-list.yaml/os-allow-list.yaml, KHÔNG
+# sinh NetworkPolicy podSelector cho các edge cross-cluster, vì cơ chế khác
+# hẳn — đánh dấu cross_cluster: true để 2 generator biết bỏ qua phần L4).
+edges:
+  - from: aws/web-portal
+    to: aws/api-gateway
+    rules:
+      - { method: GET,  paths: ["/accounts", "/transactions"] }
+      - { method: POST, paths: ["/payments"] }
+    l4_ports: [8080, 15006]
+
+  - from: aws/api-gateway
+    to: aws/payment-service
+    rules:
+      - { method: GET,  paths: ["/accounts", "/transactions"] }
+      - { method: POST, paths: ["/payments"] }
+    l4_ports: [8080, 15006]
+
+  - from: aws/payment-service
+    to: aws/fraud-detection
+    rules:
+      - { method: POST, paths: ["/score"] }
+    l4_ports: [8080, 15006]
+
+  - from: aws/payment-service
+    to: aws/notification-service
+    rules:
+      - { method: POST, paths: ["/notify"] }
+    l4_ports: [8080, 15006]
+
+  - from: aws/payment-service
+    to: openstack/core-banking
+    cross_cluster: true
+    rules:
+      - { method: GET,  paths: ["/accounts", "/transactions"] }
+      - { method: POST, paths: ["/transactions/execute"], requires: [fraud_gate_valid, posture_compliant] }
+
+  - from: openstack/core-banking
+    to: openstack/account-service
+    rules:
+      - { method: GET,  paths: ["/accounts"] }
+      - { method: POST, paths: ["/accounts/transfer"] }
+    l4_ports: [8080, 15006]
+
+  - from: openstack/core-banking
+    to: openstack/transaction-service
+    rules:
+      - { method: GET,  paths: ["/transactions"] }
+      - { method: POST, paths: ["/transactions"] }
+    l4_ports: [8080, 15006]
+
+  # edges hạ tầng (chỉ L4 — không qua OPA service_acl, không có method/path)
+  - from: aws/api-gateway
+    to: aws/redis
+    l4_only: true
+    l4_ports: [6379]
+  - from: aws/fraud-detection
+    to: aws/redis
+    l4_only: true
+    l4_ports: [6379]
+  - from: aws/web-portal
+    to: aws/redis
+    l4_only: true
+    l4_ports: [6379]
+
+  - from: openstack/account-service
+    to: openstack/postgres-accounts
+    l4_only: true
+    l4_ports: [5432]
+  - from: openstack/transaction-service
+    to: openstack/postgres-txn
+    l4_only: true
+    l4_ports: [5432]
+
+  # OPA ext_authz — mọi workload nghiệp vụ trong cluster đó cần gọi tới
+  - from: aws/web-portal
+    to: aws/opa
+    l4_only: true
+    l4_ports: [9191, 8181]
+  - from: aws/api-gateway
+    to: aws/opa
+    l4_only: true
+    l4_ports: [9191, 8181]
+  - from: aws/payment-service
+    to: aws/opa
+    l4_only: true
+    l4_ports: [9191, 8181]
+  - from: aws/fraud-detection
+    to: aws/opa
+    l4_only: true
+    l4_ports: [9191, 8181]
+  - from: aws/notification-service
+    to: aws/opa
+    l4_only: true
+    l4_ports: [9191, 8181]
+
+  - from: openstack/core-banking
+    to: openstack/opa
+    l4_only: true
+    l4_ports: [9191, 8181]
+  - from: openstack/account-service
+    to: openstack/opa
+    l4_only: true
+    l4_ports: [9191, 8181]
+  - from: openstack/transaction-service
+    to: openstack/opa
+    l4_only: true
+    l4_ports: [9191, 8181]

@@ -1,0 +1,132 @@
+# GENERATED FILE — KHÔNG SỬA TAY. Nguồn: policy/service-graph.yaml
+# Sinh lại: python3 scripts/gen-networkpolicy.py
+#
+# T-3.1/T-3.2 — mỗi NetworkPolicy chỉ siết chiều INGRESS của một workload
+# đích, khớp đúng traffic thật đã đo (T-1.1). Egress không đổi (xem
+# os-allow-list.yaml). LƯU Ý: NetworkPolicy này hiện KHÔNG được kube-router
+# enforce cho traffic có Istio sidecar trên hạ tầng đang dùng — xem
+# KET-QUA-KIEM-TRA.md §T-3.1 trước khi coi đây là lớp bảo vệ đang hoạt động.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: os-pod-account-service
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: account-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: core-banking
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 15006
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: os-pod-opa
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: opa
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: core-banking
+      ports:
+        - port: 9191
+          protocol: TCP
+        - port: 8181
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: account-service
+      ports:
+        - port: 9191
+          protocol: TCP
+        - port: 8181
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: transaction-service
+      ports:
+        - port: 9191
+          protocol: TCP
+        - port: 8181
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: os-pod-postgres-accounts
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres-accounts
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: account-service
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: os-pod-postgres-txn
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres-txn
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: transaction-service
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: os-pod-transaction-service
+  namespace: financial
+spec:
+  podSelector:
+    matchLabels:
+      app: transaction-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: core-banking
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 15006
+          protocol: TCP

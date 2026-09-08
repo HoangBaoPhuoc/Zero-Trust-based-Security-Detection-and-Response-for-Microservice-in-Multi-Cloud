@@ -37,6 +37,11 @@
         url: "{{ promtail_binary_url }}"
         dest: /tmp/promtail-linux-amd64.zip
         mode: "0644"
+        timeout: 60
+      register: promtail_download
+      retries: 3
+      delay: 10
+      until: promtail_download is succeeded
 
     - name: Unpack Promtail binary
       ansible.builtin.unarchive:

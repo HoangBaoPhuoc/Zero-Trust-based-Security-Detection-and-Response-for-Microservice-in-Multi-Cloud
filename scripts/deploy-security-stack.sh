@@ -232,6 +232,11 @@ deploy_step_3_spire_aws() {
   kubectl --context $AWS_CONTEXT -n spire create configmap spire-agent-config \
     --from-file=agent.conf="$REPO_ROOT/spire/agent/aws-agent.conf" \
     --dry-run=client -o yaml | kubectl --context $AWS_CONTEXT apply -f -
+  # T-2.1: root CA agents dùng để verify server khi bootstrap (thay
+  # insecure_bootstrap) — cùng CA server.conf dùng làm UpstreamAuthority.
+  kubectl --context $AWS_CONTEXT -n spire create configmap spire-bundle \
+    --from-file=ca.crt="$REPO_ROOT/spire/root-ca/ca.crt" \
+    --dry-run=client -o yaml | kubectl --context $AWS_CONTEXT apply -f -
 
   log_info "Labeling nodes for SPIRE server on AWS..."
   SECURITY_NODE=$(kubectl --context $AWS_CONTEXT get nodes --no-headers \
@@ -274,6 +279,10 @@ deploy_step_3_spire_os() {
     --dry-run=client -o yaml | kubectl --context $OS_CONTEXT apply -f -
   kubectl --context $OS_CONTEXT -n spire create configmap spire-agent-config \
     --from-file=agent.conf="$REPO_ROOT/spire/agent/os-agent.conf" \
+    --dry-run=client -o yaml | kubectl --context $OS_CONTEXT apply -f -
+  # T-2.1: xem giải thích trong deploy_step_3_spire_aws — cùng CA cho cả 2 cluster.
+  kubectl --context $OS_CONTEXT -n spire create configmap spire-bundle \
+    --from-file=ca.crt="$REPO_ROOT/spire/root-ca/ca.crt" \
     --dry-run=client -o yaml | kubectl --context $OS_CONTEXT apply -f -
 
   log_info "Labeling nodes for SPIRE server on OpenStack..."

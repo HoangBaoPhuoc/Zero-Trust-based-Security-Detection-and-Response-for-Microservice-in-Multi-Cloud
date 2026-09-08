@@ -1,5 +1,6 @@
 # ZTLab - fraud-detection
 
+import base64
 import os
 import time
 import uuid
@@ -11,9 +12,11 @@ import redis.asyncio as aioredis
 
 from shared.logging import ZTLabLogger, trace_middleware
 from shared.metrics import FRAUD_SCORE, SERVICE_UP
+from shared.svid_sign import build_canonical, load_own_svid, sign
 
 SERVICE = "fraud-detection"
 CLOUD = "aws"
+OWN_SPIFFE_ID = "spiffe://ztlab.local/aws/fraud-detection"
 VELOCITY_WINDOW_SECONDS = int(os.getenv("FRAUD_VELOCITY_WINDOW_SECONDS", "60"))
 VELOCITY_SOFT_LIMIT = int(os.getenv("FRAUD_VELOCITY_SOFT_LIMIT", "10"))
 HIGH_AMOUNT_VND = float(os.getenv("FRAUD_HIGH_AMOUNT_VND", "100000000"))
@@ -55,6 +58,15 @@ class FraudResponse(BaseModel):
     verdict: str
     reason: list[str]
     gate: str
+    # T-1.5: verdict integrity -- fraud-detection signs with its own SPIRE
+    # X.509-SVID private key so payment-service (a pure relay from here on)
+    # can no longer forge a passing verdict even if fully compromised.
+    # Defaults here are placeholders only: _score() builds a FraudResponse
+    # without them, the /score handler fills in the real values below before
+    # returning -- never actually sent to a caller unsigned.
+    timestamp: int = 0
+    signature: str = ""
+    cert: str = ""
 
 
 async def _velocity_score(account: str) -> tuple[int, int]:
@@ -123,10 +135,19 @@ async def _score(body: FraudRequest) -> FraudResponse:
 @app.post("/score", response_model=FraudResponse)
 async def score(req: Request, body: FraudRequest) -> FraudResponse:
     result = await _score(body)
+    trace_id = getattr(req.state, "trace_id", "") or ""
+    timestamp = int(time.time())
+    private_key, cert_chain_pem = load_own_svid()
+    canonical = build_canonical(
+        timestamp, trace_id, body.from_account, body.to_account, body.amount, body.currency, result.score
+    )
+    result.timestamp = timestamp
+    result.signature = sign(private_key, canonical)
+    result.cert = base64.b64encode(cert_chain_pem).decode()
     FRAUD_SCORE.labels(service=SERVICE, cloud=CLOUD, verdict=result.verdict).observe(result.score)
     logger.audit(
         "fraud_score_computed",
-        trace_id=getattr(req.state, "trace_id", None),
+        trace_id=trace_id,
         from_account=body.from_account,
         to_account=body.to_account,
         amount=body.amount,

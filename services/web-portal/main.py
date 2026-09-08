@@ -213,7 +213,11 @@ async def _evaluate_device_trust(request: Request, username: str) -> dict:
         try:
             is_known = await redis_client.sismember(key, device_id)
         except Exception:
-            is_known = True  # Redis down: fail open, don't punish legit users for infra issues
+            # T-4.1: trước đây fail OPEN (is_known=True) khi Redis lỗi — coi
+            # thiết bị lạ là quen. Đúng zero-trust là fail CLOSED: không xác
+            # minh được thì coi như chưa biết (new_device, +10 điểm rủi ro ở
+            # fraud-detection), không phải tự động tin tưởng.
+            is_known = False
         if is_known:
             trust = "trusted"
         else:
@@ -381,9 +385,9 @@ async def _get_user_token(username: str, password: str) -> str | None:
     return None
 
 
-async def _create_bank_account_with_token(access_token: str, username: str) -> tuple[str, str]:
+async def _create_bank_account_with_token(access_token: str, username: str, client_ip: str = "unknown") -> tuple[str, str]:
     """Create bank account using the user's OIDC access_token (no password grant needed)."""
-    headers = {"Authorization": f"Bearer {access_token}"}
+    headers = {"Authorization": f"Bearer {access_token}", "X-Forwarded-For": client_ip}
     for _ in range(5):
         account_id = _gen_account_id()
         async with httpx.AsyncClient(timeout=10) as client:
@@ -405,7 +409,7 @@ async def _create_bank_account_with_token(access_token: str, username: str) -> t
     return "", "Không thể tạo tài khoản ngân hàng (xung đột ID)"
 
 
-async def _lookup_account(username: str, access_token: str = "") -> str:
+async def _lookup_account(username: str, access_token: str = "", client_ip: str = "unknown") -> str:
     if not access_token:
         return ""
     async with httpx.AsyncClient(timeout=8) as client:
@@ -413,7 +417,7 @@ async def _lookup_account(username: str, access_token: str = "") -> str:
             resp = await client.get(
                 f"{API_GATEWAY_URL}/accounts",
                 params={"owner": username},
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {access_token}", "X-Forwarded-For": client_ip},
             )
             if resp.status_code == 200:
                 accounts = resp.json()
@@ -549,10 +553,11 @@ async def auth_callback(request: Request, code: str = "", state: str = "", error
     realm_roles = claims.get("realm_access", {}).get("roles", [])
     full_name = " ".join(filter(None, [claims.get("given_name", ""), claims.get("family_name", "")])) or preferred_username
 
-    account_id = await _lookup_account(preferred_username, access_token)
+    caller_ip = _client_ip(request)
+    account_id = await _lookup_account(preferred_username, access_token, caller_ip)
     if not account_id:
         # First login — create bank account using the user's own OIDC token
-        account_id, acc_err = await _create_bank_account_with_token(access_token, preferred_username)
+        account_id, acc_err = await _create_bank_account_with_token(access_token, preferred_username, caller_ip)
         if acc_err:
             logger.warning(json.dumps({"event": "first_login_account_create_failed",
                                        "username": preferred_username, "error": acc_err}))
@@ -833,6 +838,21 @@ async def profile_page(request: Request):
 # REST API (called via fetch() from frontend)
 # ---------------------------------------------------------------------------
 
+# T-5.1: web-portal là điểm chạm ngoài-mesh THẬT SỰ duy nhất (không có
+# Istio Gateway/NodePort nào lộ api-gateway ra ngoài — xem T-3.1) — nên
+# `request.client.host` ở ĐÂY là IP client thật (không bị sidecar terminate
+# TCP làm mất, xem KET-QUA-KIEM-TRA.md §T-0.3). Khi web-portal gọi tiếp vào
+# api-gateway (một hop mesh khác, source_ip lúc đó sẽ lại là loopback nếu
+# không relay), phải tự chuyển tiếp qua X-Forwarded-For — istio sidecar
+# KHÔNG tự thêm XFF cho traffic đông-tây (xác nhận: decision log OPA thật
+# không có trường x-forwarded-for cho bất kỳ hop pod-to-pod nào trong toàn
+# bộ phiên làm việc). api-gateway tin header này vì web-portal là caller đã
+# được service_acl (T-1.1) xác thực qua SPIFFE — tương đương "trusted proxy"
+# duy nhất trong kiến trúc hiện tại.
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
 @app.get("/api/balance/{account_id}")
 async def get_balance(account_id: str, request: Request):
     session = _get_session(request)
@@ -853,7 +873,7 @@ async def get_balance(account_id: str, request: Request):
         try:
             resp = await client.get(
                 f"{API_GATEWAY_URL}/accounts/{account_id}",
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {access_token}", "X-Forwarded-For": _client_ip(request)},
             )
             return JSONResponse(resp.json(), status_code=resp.status_code)
         except Exception:
@@ -874,7 +894,7 @@ async def get_transactions(request: Request, account_id: str = "", limit: int = 
             resp = await client.get(
                 f"{API_GATEWAY_URL}/transactions",
                 params=params,
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={"Authorization": f"Bearer {access_token}", "X-Forwarded-For": _client_ip(request)},
             )
             return JSONResponse(resp.json(), status_code=resp.status_code)
         except Exception:
@@ -888,7 +908,7 @@ async def do_transfer(request: Request):
         return JSONResponse({"error": "not authenticated"}, status_code=401)
     body = await request.json()
     access_token = await _ensure_valid_token(session)
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
     body["device_trust"] = session.get("device_trust", "unknown")
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -896,7 +916,7 @@ async def do_transfer(request: Request):
             resp = await client.post(
                 f"{API_GATEWAY_URL}/payments",
                 json=body,
-                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "X-Forwarded-For": client_ip},
             )
             result = resp.json()
             # Push security event if fraud was detected
